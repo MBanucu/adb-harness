@@ -9,15 +9,15 @@ is not supported by this version of adb"), and `ss` and `/proc/net/tcp6` are
 closed to an app, so python-zeroconf does the lookup and this script hands the
 answer to `adb connect`.
 
-    ./adb-connect.py               # discover, connect, say which port
-    ./adb-connect.py --pair        # same lookup, for the pairing port
-    ./adb-connect.py --port 38109  # skip discovery
+    adb-connect               # discover, connect, say which port
+    adb-connect --pair        # same lookup, for the pairing port
+    adb-connect --port 38109  # skip discovery
 
 Needs adb in PATH, python3 with zeroconf (`pip install zeroconf`), and Wireless
 debugging on in Developer options. A phone that has never been paired with this
 adb key has to be paired once, by hand, with the code it shows:
 
-    ./adb-connect.py --pair    # prints the command, then paste the code
+    adb-connect --pair    # prints the command, then paste the code
 """
 
 import argparse

@@ -20,20 +20,57 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # These talk to a device, so what can be checked without one is that they
-      # parse, that each Python tool builds its argument parser and answers
+      # These talk to a device, so what can be checked without one is that the
+      # package imports, that each command builds its argument parser and answers
       # --help, and that the shell one is syntax. Deep behaviour needs a phone.
       - name: syntax
         run: |
-          python3 -m py_compile capture.py adb-connect.py
-          bash -n adb-watch.sh
+          python3 -m compileall -q adb_harness
+          bash -n adb_harness/watch.sh
 
       - name: --help
         run: |
-          python3 capture.py --help
-          python3 capture.py frames --help
-          python3 adb-connect.py --help
+          python3 -m adb_harness.capture --help
+          python3 -m adb_harness.capture frames --help
+          python3 -m adb_harness.connect --help
+          python3 -m adb_harness.watch --status && exit 1 || true
 
-      - name: the tools refuse a missing argument instead of guessing
+      - name: the commands refuse a missing verb instead of guessing
         run: |
-          if python3 capture.py; then echo "capture.py with no subcommand exited 0"; exit 1; fi
+          if python3 -m adb_harness.capture; then
+            echo "capture with no verb exited 0"
+            exit 1
+          fi
+
+  package:
+    name: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Every push builds the wheel and the sdist and runs what a user installs,
+      # because tests against the checkout cannot see a wheel with the wrong entry
+      # points or a missing watch.sh.
+      - name: Build
+        run: python -m pip install build && python -m build
+
+      - name: Install the wheel and the sdist, and run them
+        run: |
+          for dist in dist/*.whl dist/*.tar.gz; do
+            echo "== $dist"
+            venv="$RUNNER_TEMP/$(basename "$dist" | tr -c 'A-Za-z0-9.\n' '-')"
+            python -m venv "$venv"
+            "$venv/bin/pip" install --quiet "$dist"
+            cd "$RUNNER_TEMP"
+            "$venv/bin/capture" --help >/dev/null
+            "$venv/bin/adb-connect" --help >/dev/null
+            if "$venv/bin/adb-watch" --status; then
+              echo "a watcher is running in a fresh container" >&2
+              exit 1
+            fi
+            "$venv/bin/python" -c 'import adb_harness; print("version", adb_harness.__version__)'
+            cd "$GITHUB_WORKSPACE"
+          done

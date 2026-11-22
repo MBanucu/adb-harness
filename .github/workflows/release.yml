@@ -1,0 +1,77 @@
+name: Release
+
+# Publishes to PyPI when a version tag is pushed, authenticating with trusted
+# publishing: there is no token in this repository. PyPI is configured to trust
+# this workflow in this repository for the `pypi` environment, and the job's OIDC
+# identity is what it checks. The first release needed a pending publisher for the
+# name (see the README).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The version lives in adb_harness/__init__.py, not in the tag or in
+      # pyproject, so a tag that disagrees with it would publish a package whose
+      # version is not the one it was tagged with.
+      - name: The tag matches the package
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          got=$(python -c 'import adb_harness; print(adb_harness.__version__)')
+          if [ "$want" != "$got" ]; then
+            echo "tag $GITHUB_REF_NAME but adb_harness.__version__ is $got" >&2
+            exit 1
+          fi
+          echo "publishing $got"
+
+      - name: Build
+        run: python -m pip install build && python -m build
+
+      # The wheel is what users get, so install that file in a directory with no
+      # checkout to fall back on and run the three commands from it.
+      - name: Install the wheel and run it
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/venv/bin/capture" --help >/dev/null
+          "$RUNNER_TEMP/venv/bin/adb-connect" --help >/dev/null
+          # Nothing is watching in a fresh container, which is what --status
+          # reports by exiting 1 and saying so.
+          if out=$("$RUNNER_TEMP/venv/bin/adb-watch" --status); then
+            echo "adb-watch --status found a watcher in a fresh container" >&2
+            exit 1
+          fi
+          case "$out" in
+            *"not running"*) ;;
+            *) echo "unexpected --status output: $out" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

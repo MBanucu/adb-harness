@@ -6,12 +6,12 @@ writes an event next to every moment worth finding later: a check starting, a
 key typed, a frame asked for. Nothing is extracted while the tests run. This
 script is the recording, the events, and the "extract that frame now" part.
 
-    python3 capture.py start --dir out/capture
-    python3 capture.py event session:typed
-    python3 capture.py stop
-    python3 capture.py frames --event session:typed --out out/frames
-    python3 capture.py frames --at 12.5,40 --out out/frames
-    python3 capture.py show
+    capture start --dir out/capture
+    capture event session:typed
+    capture stop
+    capture frames --event session:typed --out out/frames
+    capture frames --at 12.5,40 --out out/frames
+    capture show
 
 Why the mapping is exact, and not "the video starts when I pressed start"
 ------------------------------------------------------------------------
@@ -502,7 +502,7 @@ def cmd_frames(args):
     return 0
 
 
-def main(argv):
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Record a run once, keep the moments as events, extract "
                     "frames when asked.")
@@ -541,7 +541,7 @@ def main(argv):
     frames.add_argument("--sidecar", default="")
     frames.set_defaults(run=cmd_frames)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     # `--dir` is accepted on either side of the verb; the shell writes it after.
     args.dir = args.sub_dir or args.dir
     return args.run(args)

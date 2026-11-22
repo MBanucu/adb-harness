@@ -3,25 +3,36 @@
 #
 # The port changes whenever Wireless debugging is turned off and on again, so a
 # connection that worked earlier simply disappears. This loop checks the adb
-# device list, and while there is no device it runs `adb-connect.py`, which
-# asks mDNS for the current `_adb-tls-connect._tcp` port and connects to it.
+# device list, and while there is no device it runs `adb-connect`, which asks
+# mDNS for the current `_adb-tls-connect._tcp` port and connects to it.
 #
-#   bash adb-watch.sh                 # run in the foreground
-#   kill "$(cat out/adb-watch.pid)"   # stop a running watcher
+#   adb-watch                        # run in the foreground
+#   adb-watch --status               # is it running, and is a device attached
+#   kill "$(cat out/adb-watch.pid)"  # stop a running watcher
+#
+# From a checkout, `python3 -m adb_harness.watch` does the same.
 #
 # Environment: ADB_WATCH_INTERVAL (seconds, default 15), ADB_WATCH_OUT (the
-# directory holding the pid and log, default out/ beside this script) and
+# directory holding the pid and log, default out/ in the working directory) and
 # ADB_WATCH_LOG (default `$ADB_WATCH_OUT/adb-watch.log`). State changes are
 # logged; a repeated failure is logged again only when the message changes or ten
 # minutes have passed, so a phone left with Wireless debugging off does not fill
 # the log.
 set -u
 
-here=$(cd "$(dirname "$0")" && pwd)
-# A caller that keeps its own scratch directory (a test suite, say) points these
-# at it rather than finding the watcher's state under this checkout.
-out=${ADB_WATCH_OUT:-$here/out}
+# Where the pid and the log go: the caller's scratch directory when it names one,
+# otherwise out/ in the working directory. This is the installed package's copy,
+# so its own directory is not a sensible place to write.
+out=${ADB_WATCH_OUT:-$PWD/out}
 mkdir -p "$out"
+
+# Reconnecting is adb-connect's job. Installed, that is its command on PATH; from
+# a checkout, it is the module beside this file.
+if command -v adb-connect >/dev/null 2>&1; then
+    connect=(adb-connect)
+else
+    connect=(python3 -m adb_harness.connect)
+fi
 log=${ADB_WATCH_LOG:-$out/adb-watch.log}
 interval=${ADB_WATCH_INTERVAL:-15}
 pidfile=$out/adb-watch.pid
@@ -54,7 +65,12 @@ if [ -f "$pidfile" ]; then
     fi
 fi
 printf '%s\n' "$$" >"$pidfile"
-trap 'rm -f "$pidfile"' EXIT INT TERM
+# Stopping the watcher is `kill "$(cat out/adb-watch.pid)"`, so the signals have
+# to end the loop: a handler that only removed the pidfile left the loop running
+# and writing the file again on its next pass.
+cleanup() { rm -f "$pidfile"; }
+trap cleanup EXIT
+trap 'exit 0' INT TERM
 
 say "watcher started (pid $$, every ${interval}s)"
 state=""
@@ -72,7 +88,7 @@ while true; do
         failure=""
     else
         state=""
-        output=$(timeout 30 python3 "$here/adb-connect.py" 2>&1)
+        output=$(timeout 30 "${connect[@]}" 2>&1)
         status=$?
         now=$(date +%s)
         if [ "$status" -eq 0 ]; then
@@ -88,5 +104,8 @@ while true; do
             fi
         fi
     fi
-    sleep "$interval"
+    # In the background, so a kill is acted on now rather than when the sleep
+    # ends: bash runs a trap only once the foreground command has returned.
+    sleep "$interval" &
+    wait $! 2>/dev/null || true
 done

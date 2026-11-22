@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adb-harness"
+dynamic = ["version"]
+description = "Find a phone's wireless-debugging adb port, keep it connected, and record its screen"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [{ name = "MBanucu", email = "MBanucu@users.noreply.github.com" }]
+keywords = ["adb", "android", "termux", "screenrecord", "mdns", "wireless-debugging", "testing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Unix Shell",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Systems Administration",
+]
+# adb-connect needs python-zeroconf to ask mDNS, and only then: capture and
+# adb-watch work without it, so it is an extra rather than a dependency of
+# everything.
+dependencies = []
+
+[project.optional-dependencies]
+mdns = ["zeroconf>=0.36"]
+
+[project.urls]
+Homepage = "https://github.com/MBanucu/adb-harness"
+Source = "https://github.com/MBanucu/adb-harness"
+Issues = "https://github.com/MBanucu/adb-harness/issues"
+
+[project.scripts]
+capture = "adb_harness.capture:main"
+adb-connect = "adb_harness.connect:main"
+adb-watch = "adb_harness.watch:main"
+
+[tool.setuptools]
+packages = ["adb_harness"]
+
+# The watcher is a shell script the adb-watch entry point runs from the package.
+[tool.setuptools.package-data]
+adb_harness = ["watch.sh"]
+
+[tool.setuptools.dynamic]
+version = { attr = "adb_harness.__version__" }
