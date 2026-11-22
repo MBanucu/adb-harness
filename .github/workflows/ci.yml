@@ -22,11 +22,15 @@ jobs:
 
       # These talk to a device, so what can be checked without one is that the
       # package imports, that each command builds its argument parser and answers
-      # --help, and that the shell one is syntax. Deep behaviour needs a phone.
+      # --help, and that the shell one is syntax. The mapping is the exception:
+      # it is arithmetic over a recording, and tests/test_capture.py builds one.
       - name: syntax
         run: |
           python3 -m compileall -q adb_harness
           bash -n adb_harness/watch.sh
+
+      - name: unit tests
+        run: python3 -W error::ResourceWarning -m unittest discover -s tests -v
 
       - name: --help
         run: |

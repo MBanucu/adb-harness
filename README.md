@@ -87,11 +87,26 @@ package, falling back to `python3 -m adb_harness.connect` for reconnects.
 
 ## Tests
 
-These talk to a device, so there is no unit suite here: what CI checks is that the
-package builds, that a wheel installed in a fresh virtualenv gives the three
-commands, and that each one answers `--help` (and that `capture` with no verb
-refuses instead of guessing). The behaviour that needs a phone is checked where
-they are used, in `android-accessible-terminal`'s e2e suite.
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The mapping is arithmetic over a recording, so it has a test suite that needs no
+phone: `tests/test_capture.py` builds a synthetic MP4 of the shape `screenrecord`
+writes — an `ftyp`, a `moov` with a metadata track whose one sample is a Winscope
+payload, and that sample in `mdat` — and checks what an event becomes against it:
+the frame that was on screen, how long before the event it appeared, the container
+time it gets, events the device timed itself (which take no offset), events before
+the first frame and after the last, and a container whose frame list disagrees
+with the metadata track. The parser is covered the same way: both magic versions,
+the elapsed clock winning over the monotonic one, no metadata track at all, frame
+times out of order, and a truncated file.
+
+What needs a device — recording, pulling, extracting frames, reconnecting — is
+checked where the tools are used, in `android-accessible-terminal`'s e2e suite.
+CI also builds the package on every push and installs the wheel and the sdist in a
+fresh virtualenv, because tests against the checkout cannot see a wheel with the
+wrong entry points or a missing `watch.sh`.
 
 ## Releasing
 

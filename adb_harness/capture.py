@@ -174,7 +174,8 @@ def track_samples(data, offsets, chunks, sizes):
 
 def parse_metadata(path):
     """Frame times from the Winscope metadata track: {clock, frames, epoch_offset}."""
-    data = open(path, "rb").read()
+    with open(path, "rb") as handle:
+        data = handle.read()
     best = None
     for kind, pos, header, size in boxes(data, 0, len(data)):
         if kind != b"trak":
@@ -361,7 +362,9 @@ def map_events(directory, sidecar):
     path = os.path.join(directory, EVENTS)
     if not os.path.isfile(path):
         return out
-    for line in open(path, errors="replace"):
+    with open(path, errors="replace") as handle:
+        lines = handle.read().splitlines()
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -406,8 +409,13 @@ def map_events(directory, sidecar):
                 mapped["before_video"] = True
             if at < len(pts):
                 mapped["video_s"] = round(pts[at], 3)
-            else:
+            elif pts:
+                # The container lists fewer frames than the metadata does: the
+                # last time it knows is extended by the gap the metadata reports.
                 mapped["video_s"] = round(pts[-1] + (device_ns - frames[-1]) / 1e9, 3)
+            # With no container times at all (no ffprobe, or a file it cannot
+            # read) there is no presentation time to report, and the frame index
+            # and the time since that frame are still the answer.
         out.append(mapped)
     return out
 
