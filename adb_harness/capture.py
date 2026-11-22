@@ -208,10 +208,19 @@ def parse_metadata(path):
 
 
 def container_pts(path):
-    """The container's own pts per frame, in presentation order."""
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-         "frame=pts_time", "-of", "csv=p=0", path], capture_output=True, text=True)
+    """The container's own pts per frame, in presentation order, or nothing.
+
+    No ffprobe on this machine, or a file it cannot read, is a recording without
+    container times rather than a failure: the frame index and the metadata
+    track's own times still say which picture was on screen.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "frame=pts_time", "-of", "csv=p=0", path],
+            capture_output=True, text=True)
+    except OSError:
+        return []
     if result.returncode != 0:
         return []
     stamps = []

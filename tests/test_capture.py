@@ -271,6 +271,20 @@ class MappingTest(unittest.TestCase):
         self.assertEqual([e["name"] for e in mapped], ["one", "two"])
 
 
+class ContainerPtsTest(unittest.TestCase):
+    def test_no_ffprobe_is_no_container_times(self):
+        # Not every machine that runs this has ffmpeg, and a traceback is not an
+        # answer: without it the mapping reports frame indices and nothing more.
+        with mock.patch.object(capture.subprocess, "run",
+                               side_effect=FileNotFoundError("ffprobe")):
+            self.assertEqual(capture.container_pts("whatever.mp4"), [])
+
+    def test_ffprobe_refusing_the_file_is_no_container_times(self):
+        done = mock.Mock(returncode=1, stdout="", stderr="Invalid data")
+        with mock.patch.object(capture.subprocess, "run", return_value=done):
+            self.assertEqual(capture.container_pts("whatever.mp4"), [])
+
+
 class FrameCommandTest(unittest.TestCase):
     def test_it_seeks_just_before_the_frame(self):
         command = capture.frame_command("recording.mp4", 12.5, "out.png")
