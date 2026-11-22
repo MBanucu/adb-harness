@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  check:
+    name: check (${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # These talk to a device, so what can be checked without one is that they
+      # parse, that each Python tool builds its argument parser and answers
+      # --help, and that the shell one is syntax. Deep behaviour needs a phone.
+      - name: syntax
+        run: |
+          python3 -m py_compile capture.py adb-connect.py
+          bash -n adb-watch.sh
+
+      - name: --help
+        run: |
+          python3 capture.py --help
+          python3 capture.py frames --help
+          python3 adb-connect.py --help
+
+      - name: the tools refuse a missing argument instead of guessing
+        run: |
+          if python3 capture.py; then echo "capture.py with no subcommand exited 0"; exit 1; fi
