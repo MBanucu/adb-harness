@@ -26,12 +26,14 @@ set -u
 out=${ADB_WATCH_OUT:-$PWD/out}
 mkdir -p "$out"
 
-# Reconnecting is adb-connect's job. Installed, that is its command on PATH; from
-# a checkout, it is the module beside this file.
+# Reconnecting is adb-connect's job. Installed, that is its command on PATH (the
+# adb-watch entry point puts the environment's bin directory there); from a
+# checkout, it is the module beside this file, run by the interpreter that started
+# the watcher when there is one.
 if command -v adb-connect >/dev/null 2>&1; then
     connect=(adb-connect)
 else
-    connect=(python3 -m adb_harness.connect)
+    connect=("${ADB_HARNESS_PYTHON:-python3}" -m adb_harness.connect)
 fi
 log=${ADB_WATCH_LOG:-$out/adb-watch.log}
 interval=${ADB_WATCH_INTERVAL:-15}

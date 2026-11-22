@@ -14,4 +14,4 @@ Nothing here is a library: the modules are the commands' implementations and the
 shell script the watcher runs.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
