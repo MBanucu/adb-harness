@@ -25,6 +25,9 @@ pip install "adb-harness[mdns]"   # and python-zeroconf, which adb-connect needs
 adb-connect               # discover, connect, say which port
 adb-connect --pair        # same lookup, for the pairing port
 adb-connect --port 38109  # skip discovery
+adb-connect --json        # one JSON object on stdout, for a harness
+adb-connect --quiet       # no progress lines; the final output still prints
+adb-connect --version     # print the version and exit
 ```
 
 The port changes every time Wireless debugging is turned off and on again, so a
@@ -41,6 +44,9 @@ hand, with the code it shows: `adb-connect --pair` prints the command.
 ```sh
 adb-watch                        # run in the foreground
 adb-watch --status               # is it running, and is a device attached
+adb-watch --status --json        # the same, as one JSON object
+adb-watch --json                 # one JSON object per state change
+adb-watch --interval 5 --max-attempts 10
 kill "$(cat out/adb-watch.pid)"  # stop a running watcher
 ```
 
@@ -49,16 +55,22 @@ repeated failure is logged again only when the message changes or ten minutes ha
 passed, so a phone left with Wireless debugging off does not fill the log.
 `ADB_WATCH_INTERVAL` (default 15 s), `ADB_WATCH_OUT` (pid and log directory,
 default `out/` in the working directory) and `ADB_WATCH_LOG` change that.
+`--interval` overrides the interval; `--max-attempts N` stops after `N` reconnect
+attempts (`0`, the default, means no bound) and exits `0` if a device is attached
+and `1` if not. `--quiet` leaves the log alone but still writes the JSON objects.
 
 ## capture
 
 ```sh
 capture start --dir out/capture     # one recording for the run
+capture start --json                # {"recording":true,"source":"...","dir":"..."}
 capture event session:typed         # mark a moment; no adb call
 capture stop                        # stop, and map events to frames
 capture show                        # every event of a recording, with its frame
+capture show --json                 # the sidecar as one object, with a schema
 capture frames --event session:typed --out out/frames
 capture frames --at 12.5,40 --out out/frames
+capture --version                   # print the version and exit
 ```
 
 `stop` keeps the video, the events and a sidecar in `--dir`; `frames` takes a
@@ -89,6 +101,72 @@ does not match its checksum is refused rather than installed.
 `frames` needs `ffmpeg` on `PATH`; `stop` says what the offset between the two
 clocks was, and where the device is older than that metadata track (Android 12
 and older) screenrecord itself has no per-frame times to offer.
+
+## Machine-readable output
+
+Every JSON object names its shape and the version of that shape, so a harness can
+refuse a tool it does not know:
+
+```json
+{"schema":"adb-connect","version":1,"ok":true,"address":"127.0.0.1:38109","port":38109,"serial":"127.0.0.1:38109","source":"mdns","waited_s":1.2}
+```
+
+`adb-connect --json` prints one object, success or failure, on stdout. On success
+`source` is `mdns`, `port` (a named `--port`) or `attached` (a device was already
+there). A failure keeps the same keys `ok` and `port` (`null` when no port is
+known), and adds `reason` and `detail`; `reason` is one of `no-service`,
+`stale-port`, `no-adb` and `no-mdns`:
+
+```json
+{"schema":"adb-connect","version":1,"ok":false,"reason":"stale-port","detail":"127.0.0.1:38109: failed to connect: Connection refused","port":38109}
+```
+
+`adb-watch --status --json` is one object; without `--status`, `--json` writes one
+object per state change to stdout:
+
+```json
+{"schema":"adb-watch","version":1,"running":true,"pid":4242,"devices":["127.0.0.1:38109"],"attempts":0}
+{"schema":"adb-watch","version":1,"event":"reconnected","devices":["127.0.0.1:38109"],"attempts":2,"serial":"127.0.0.1:38109"}
+```
+
+`event` is `connected`, `reconnected`, `disconnected` or `error`; an `error` also
+carries the `detail` adb-connect last said.
+
+`capture start --json` names the recording that started:
+
+```json
+{"schema":"capture-start","version":1,"recording":true,"source":"stream","dir":"out/capture","serial":"127.0.0.1:38109"}
+```
+
+`capture show --json` is the sidecar `stop` wrote, with the schema added rather
+than a second format. Written back to a file it is a `--sidecar` for `frames`:
+
+```sh
+capture show --json > out/capture/shown.json
+capture frames --sidecar out/capture/shown.json --event session:typed --out out/frames
+```
+
+```json
+{"schema":"capture-recording","version":1,"recording":"recording.mp4","source":"screenrecord","size":1843200,"duration":12.34,"events":[{"name":"session:typed","host":51.02,"timed":"host","frame":8,"since_frame_ms":21.0,"video_s":0.264}],"frames":[51000000000,51033000000],"sync":{"clock":"elapsed","unit_ns":1000000000,"frame_count":2,"epoch_offset_ns":0,"offset":-49.9,"offset_samples":2,"offset_spread_ms":2.1,"round_trip_ms":18.4}}
+```
+
+`--quiet` suppresses progress lines for `adb-connect`, `start` and the watcher's
+log, but never the final object. `--version` on `adb-connect`, `adb-watch` and
+`capture` prints the command and its version and exits `0`.
+
+### Exit codes
+
+One table, used by all three commands:
+
+| code | meaning |
+|---|---|
+| `0` | success |
+| `1` | failed to connect or record: nothing advertised, a port that nothing answers, no device, screenrecord would not start, frames could not be written |
+| `2` | usage error: an unknown flag, a missing verb or argument, `--at` that is not seconds, nothing asked for with `frames` |
+| `3` | a prerequisite is missing: no `adb`, no `python-zeroconf`, or no `ffmpeg` for `frames` |
+
+The JSON objects carry the matching `reason`; the exit code is what a shell
+should branch on.
 
 ## From a checkout
 

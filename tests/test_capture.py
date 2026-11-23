@@ -346,7 +346,8 @@ class StrategyTest(unittest.TestCase):
                   if stream_says is not None
                   else mock.patch.object(capture.Stream, "start",
                                          return_value={"reader_pid": 1234}))
-        with mock.patch.object(capture, "adb",
+        with mock.patch.object(capture.shutil, "which", return_value="/usr/bin/adb"), \
+                mock.patch.object(capture, "adb",
                                return_value=mock.Mock(returncode=0)), \
                 mock.patch.object(capture, "sample_clock",
                                   return_value={"offset": 0.0, "error": 0.0}), \
@@ -355,8 +356,7 @@ class StrategyTest(unittest.TestCase):
                                   return_value={"remote": capture.REMOTE}), \
                 stream:
             if expect_exit:
-                with self.assertRaises(SystemExit):
-                    capture.cmd_start(args)
+                self.assertEqual(capture.cmd_start(args), capture.EXIT_FAILURE)
                 return None
             capture.cmd_start(args)
         with open(os.path.join(self.directory.name, capture.STATE)) as handle:
