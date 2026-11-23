@@ -32,7 +32,7 @@ import importlib
 from .errors import (CaptureFailed, HarnessError, NoAdb, NoMdns,
                      NotConnected, SourceUnavailable)
 
-__version__ = "0.2.3"
+__version__ = "0.3.0"
 
 __all__ = [
     "capture",

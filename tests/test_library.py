@@ -192,8 +192,12 @@ class CaptureLibraryTest(unittest.TestCase):
                                   side_effect=self.fake_stop()):
             session = self.session()
             session.start()
+            with self.assertRaises(CaptureFailed):
+                session.start()
             session.event("one")
             first = session.stop()
+            with self.assertRaises(CaptureFailed):
+                session.event("too-late")
             second = session.stop()
         self.assertIs(first, second)
         with open(first.sidecar) as handle:

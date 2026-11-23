@@ -208,6 +208,8 @@ class Session:
 
     def start(self):
         """Starts the recording and writes the state and the start event."""
+        if self._started:
+            raise CaptureFailed("this session is already recording")
         self._require_adb()
         os.makedirs(self.dir, exist_ok=True)
         self.serial = self.serial or os.environ.get("ANDROID_SERIAL", "")
@@ -249,6 +251,8 @@ class Session:
 
     def event(self, name, data=None):
         """Marks a moment. A file append only: no process and no adb call."""
+        if self._recording is not None:
+            raise CaptureFailed("this session has already stopped")
         if not self._started and not os.path.isfile(
                 os.path.join(self.dir, STATE)):
             raise CaptureFailed("no recording in %s (run start first)" % self.dir)
