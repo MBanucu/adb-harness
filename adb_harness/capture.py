@@ -69,8 +69,9 @@ import time
 
 from .device import adb, device_shell, host_clock, sample_clock  # noqa: F401
 from .mp4 import MAGIC_V1, MAGIC_V2, boxes, container_pts, parse_metadata  # noqa: F401
+from .errors import SourceUnavailable  # noqa: F401
 from .sources import (BASE_UUID, REMOTE, STRATEGIES, RECORDING, STREAM_PORT,  # noqa: F401
-                      SourceUnavailable, Screenrecord, Stream, cmd_read, stream_base)
+                      Screenrecord, Stream, cmd_read, stream_base)
 
 STATE = "capture.json"
 EVENTS = "events.jsonl"
@@ -381,6 +382,10 @@ def main(argv=None):
                        default="auto",
                        help="how to record: screenstream, falling back to "
                             "screenrecord (default); stream; screenrecord")
+    start.add_argument("--apk", default="",
+                       help="APK to install when the screenstream app is missing "
+                            "(default: the latest GitHub release; CAPTURE_APK also "
+                            "works)")
     start.set_defaults(run=cmd_start)
 
     event = with_dir(sub.add_parser("event", help="mark a moment; no adb call"))

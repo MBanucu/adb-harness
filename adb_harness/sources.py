@@ -13,17 +13,14 @@ import subprocess
 import sys
 import time
 
+from .app import ACTIVITY, PACKAGE, STATUS, ensure_installed
 from .device import adb, device_shell
+from .errors import SourceUnavailable
 from .mp4 import boxes, container_pts, parse_metadata
 
 RECORDING = "recording.mp4"
 REMOTE = "/data/local/tmp/suite-capture.mp4"
 
-# screenstream: the second way to record. Its encoded stream carries the device
-# clock's reading for the track's zero, so its frames are timed without a track.
-PACKAGE = "io.github.mbanucu.screenstream.app"
-ACTIVITY = PACKAGE + "/io.github.mbanucu.screenstream.ScreenStreamActivity"
-STATUS = "/sdcard/Android/data/%s/files/screenstream.txt" % PACKAGE
 STREAM_PORT = 7101
 BASE_UUID = bytes.fromhex("6d42414e7563750073747265616d0001")
 
@@ -67,10 +64,6 @@ def stream_base(path):
                     continue
                 return struct.unpack(">Q", data[body + 24:body + 32])[0]
     return None
-
-
-class SourceUnavailable(Exception):
-    """A way of recording cannot run here; `auto` falls back to screenrecord."""
 
 
 class Screenrecord:
@@ -130,6 +123,10 @@ class Stream:
     name = "stream"
 
     def start(self, args, serial):
+        # Without the app there is nothing to stream, and the recorder that would
+        # be the fallback needs nothing installed: the release APK is what makes
+        # a machine that has never run this suite work.
+        ensure_installed(getattr(args, "apk", ""), serial)
         # A second launch of the activity ends the projection the first one owns, so
         # a run begins from a stopped app rather than from whatever was left.
         device_shell("am force-stop %s" % PACKAGE, serial)

@@ -8,6 +8,7 @@ makes the parser and the mapping testable without a device, and without ffmpeg:
 is patched where the expected pts matter and left empty where they do not.
 """
 
+import hashlib
 import json
 import os
 import struct
@@ -18,7 +19,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from adb_harness import capture  # noqa: E402
+from adb_harness import app as installer  # noqa: E402
+from adb_harness import capture, sources  # noqa: E402
 
 
 # --- building a recording ----------------------------------------------------
@@ -372,6 +374,67 @@ class StrategyTest(unittest.TestCase):
 
     def test_asking_for_the_stream_alone_does_not_fall_back(self):
         self.start("stream", capture.SourceUnavailable("no app"), expect_exit=True)
+
+
+class InstallTest(unittest.TestCase):
+    """Whether the app has to be installed before its stream can be had."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def fetch(self, digest_ok):
+        """Stands in for `gh release download`: writes the two release files."""
+        def run(command, **kwargs):
+            apk = "screenstream-0.2.1.apk"
+            with open(os.path.join(self.directory.name, apk), "wb") as handle:
+                handle.write(b"an apk")
+            digest = hashlib.sha256(b"an apk").hexdigest()
+            if not digest_ok:
+                digest = "0" * 64
+            with open(os.path.join(self.directory.name, apk + ".sha256"), "w") as handle:
+                handle.write("%s  %s\n" % (digest, apk))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        return run
+
+    def test_an_installed_app_needs_no_apk(self):
+        found = mock.Mock(returncode=0, stdout="package:/data/app/base.apk")
+        with mock.patch.object(installer, "device_shell", return_value=found):
+            self.assertTrue(installer.installed("S"))
+
+    def test_a_missing_app_is_recognised(self):
+        gone = mock.Mock(returncode=0, stdout="")
+        with mock.patch.object(installer, "device_shell", return_value=gone):
+            self.assertFalse(installer.installed("S"))
+
+    def test_a_named_apk_is_used_without_fetching(self):
+        path = os.path.join(self.directory.name, "app.apk")
+        with open(path, "wb") as handle:
+            handle.write(b"apk")
+        with mock.patch.object(installer.subprocess, "run",
+                               side_effect=AssertionError("fetched anyway")):
+            self.assertEqual(installer.apk(path), path)
+
+    def test_a_named_apk_that_is_not_there_is_refused(self):
+        args = mock.Mock(apk=os.path.join(self.directory.name, "absent.apk"))
+        with self.assertRaises(installer.SourceUnavailable):
+            installer.apk(args.apk)
+
+    def test_the_release_apk_is_checked_against_its_checksum(self):
+        with mock.patch.object(installer.tempfile, "mkdtemp",
+                               return_value=self.directory.name), \
+                mock.patch.object(installer.subprocess, "run",
+                                  side_effect=self.fetch(digest_ok=True)):
+            apk = installer.apk()
+        self.assertTrue(apk.endswith("screenstream-0.2.1.apk"))
+
+    def test_an_apk_that_does_not_match_is_refused(self):
+        with mock.patch.object(installer.tempfile, "mkdtemp",
+                               return_value=self.directory.name), \
+                mock.patch.object(installer.subprocess, "run",
+                                  side_effect=self.fetch(digest_ok=False)):
+            with self.assertRaises(installer.SourceUnavailable):
+                installer.apk()
 
 
 if __name__ == "__main__":

@@ -79,6 +79,13 @@ its frame times into a metadata track beside the video instead, so the sidecar's
 `sync` block differs in one field (`base_ns` for the stream, the track's own
 `epoch_offset_ns` for screenrecord) while the events come out the same.
 
+A machine that has never had the app installed does not need a build step: `start`
+checks `pm path`, and when the app is missing it takes the APK from the latest
+GitHub release (`gh release download`), checks it against the checksum the release
+carries, and installs it — 4 s from nothing to a recording, measured here. `--apk
+PATH` or `CAPTURE_APK` uses a build from a checkout instead, and a download that
+does not match its checksum is refused rather than installed.
+
 `frames` needs `ffmpeg` on `PATH`; `stop` says what the offset between the two
 clocks was, and where the device is older than that metadata track (Android 12
 and older) screenrecord itself has no per-frame times to offer.
