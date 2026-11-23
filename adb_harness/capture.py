@@ -13,21 +13,37 @@ script is the recording, the events, and the "extract that frame now" part.
     capture frames --at 12.5,40 --out out/frames
     capture show
 
+Two ways to record, one mapping
+-------------------------------
+The recording is screenstream's H.264 stream when it can be had: `start` brings up
+the app, subscribes to its encoded port, and `stop` saves what arrived as a
+fragmented MP4. That stream carries the device clock's reading for its track's
+zero in its init segment, so a frame's time is the container's own pts plus that
+base - the same clock the raw stream and `/proc/uptime` use. `--source stream`
+insists on it; `--source auto` (the default) falls back to `screenrecord` when the
+app is not installed, cannot get the projection, or never starts, printing why.
+
+The fallback is the device's own screenrecord, timed by its Winscope metadata
+track - the same clock, a different place to read it from. Everything after
+`stop` is the same for both: a frame time in device nanoseconds per frame, then
+the last frame at or before each event.
+
 Why the mapping is exact, and not "the video starts when I pressed start"
 ------------------------------------------------------------------------
-`screenrecord` writes the presentation time of every frame, in the device's
-elapsed-realtime clock, into a metadata track beside the video (
-`writeWinscopeMetadata` in frameworks/av's screenrecord.cpp): a magic string, the
-frame count, and one 64-bit timestamp per frame. That is the same clock
-`/proc/uptime` reports, so a moment logged on the device and a frame in the video
-are comparable numbers rather than two clocks to be eyeballed against each other.
+Both sources time every frame on the device's elapsed-realtime clock: the same
+clock `/proc/uptime` reports, so a moment logged on the device and a frame in the
+video are comparable numbers rather than two clocks to be eyeballed at each other.
+`screenrecord` writes those times into a metadata track beside the video (
+`writeWinscopeMetadata` in frameworks/av's screenrecord.cpp: a magic string, the
+frame count, and one 64-bit timestamp per frame), while screenstream writes the
+reading for the track's zero once, in its init segment, and lets the container's
+pts say the rest. Either way this script ends up with one timestamp per frame.
 
-This script reads that track out of the MP4 itself (ffprobe does not expose data
-tracks) and pairs it with the container's own pts, so an event becomes a frame
-index: the last frame presented at or before the event. An event therefore maps
-to the picture that was on screen at that moment, which is what a screenshot
-means. No frame rate is assumed; `screenrecord` records frames only when the
-screen changes, and gaps in time are gaps in the list.
+It pairs those with the container's own pts, so an event becomes a frame index:
+the last frame presented at or before the event. An event therefore maps to the
+picture that was on screen at that moment, which is what a screenshot means. No
+frame rate is assumed; both sources record a frame only when the screen changes,
+and gaps in time are gaps in the list.
 
 The one number that is not from the video is the offset between the device's
 clock and this machine's: the suite logs `event` on this side, the frames are
@@ -47,193 +63,17 @@ import argparse
 import json
 import os
 import re
-import shutil
-import struct
 import subprocess
 import sys
 import time
 
-MAGIC_V1 = b"#VV1NSC0PET1ME!#"
-MAGIC_V2 = b"#VV1NSC0PET1ME2#"
-CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"dinf"}
+from .device import adb, device_shell, host_clock, sample_clock  # noqa: F401
+from .mp4 import MAGIC_V1, MAGIC_V2, boxes, container_pts, parse_metadata  # noqa: F401
+from .sources import (BASE_UUID, REMOTE, STRATEGIES, RECORDING, STREAM_PORT,  # noqa: F401
+                      SourceUnavailable, Screenrecord, Stream, cmd_read, stream_base)
+
 STATE = "capture.json"
 EVENTS = "events.jsonl"
-RECORDING = "recording.mp4"
-REMOTE = "/data/local/tmp/suite-capture.mp4"
-
-
-def adb(args, serial="", capture=True):
-    command = [os.environ.get("ADB", "adb")]
-    if serial:
-        command += ["-s", serial]
-    command += args
-    if capture:
-        return subprocess.run(command, capture_output=True, text=True)
-    return subprocess.run(command)
-
-
-def device_shell(command, serial=""):
-    return adb(["shell", command], serial)
-
-
-def host_clock():
-    """This machine's monotonic seconds: a clock ntpd cannot step.
-
-    Termux cannot read /proc/uptime (SELinux), and time.monotonic is the same
-    kind of clock anyway. It is not the device's boot clock: the difference is
-    the machine's own suspend time, a constant for the run, and it lands in the
-    measured offset rather than in the mapping.
-    """
-    return time.monotonic()
-
-
-def device_uptime(serial=""):
-    """The device's elapsed-realtime seconds, the clock the video's frames use."""
-    result = device_shell("cat /proc/uptime", serial)
-    if result.returncode != 0:
-        return None
-    return float(result.stdout.split()[0])
-
-
-def sample_clock(serial=""):
-    """(device - host) in seconds, with the half round trip as its error bar."""
-    before = host_clock()
-    device = device_uptime(serial)
-    after = host_clock()
-    if device is None:
-        return None
-    # The device's reading was taken somewhere inside the call, so the middle of
-    # the call is the best guess at when, and half the call is how wrong that is.
-    return {"offset": device - (before + after) / 2.0, "error": (after - before) / 2.0}
-
-
-# --- the MP4's metadata track ------------------------------------------------
-
-
-def boxes(data, start, end):
-    pos = start
-    while pos + 8 <= end:
-        size, kind = struct.unpack(">I4s", data[pos:pos + 8])
-        header = 8
-        if size == 1:
-            size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
-            header = 16
-        if size < header or pos + size > end:
-            return
-        yield kind, pos, header, size
-        if kind in CONTAINERS:
-            yield from boxes(data, pos + header, pos + size)
-        pos += size
-
-
-def full_box(body, fields):
-    """Read a version-0 full box's fields: a 4-byte version/flags, then values."""
-    values = struct.unpack(">" + fields, body[4:4 + struct.calcsize(">" + fields)])
-    return values
-
-
-def track_tables(data, start, end):
-    """What a track's sample tables say: handler, sizes, offsets, chunk layout."""
-    handler = None
-    sizes, offsets, chunks = [], [], []
-    for kind, pos, header, size in boxes(data, start, end):
-        body = data[pos + header:pos + size]
-        if kind == b"hdlr":
-            handler = body[8:12]
-        elif kind == b"stsz":
-            default, count = full_box(body, "II")
-            sizes = [default] * count if default else list(
-                struct.unpack(">%dI" % count, body[12:12 + 4 * count]))
-        elif kind == b"stco":
-            count = full_box(body, "I")[0]
-            offsets = list(struct.unpack(">%dI" % count, body[8:8 + 4 * count]))
-        elif kind == b"co64":
-            count = full_box(body, "I")[0]
-            offsets = list(struct.unpack(">%dQ" % count, body[8:8 + 8 * count]))
-        elif kind == b"stsc":
-            count = full_box(body, "I")[0]
-            for i in range(count):
-                chunks.append(struct.unpack(">III", body[8 + 12 * i:20 + 12 * i])[:2])
-    return handler, sizes, offsets, chunks
-
-
-def track_samples(data, offsets, chunks, sizes):
-    index, out = 0, []
-    for piece, (first_chunk, per_chunk) in enumerate(chunks):
-        last = (chunks[piece + 1][0] - 1) if piece + 1 < len(chunks) else len(offsets)
-        for chunk in range(first_chunk, last + 1):
-            offset = offsets[chunk - 1]
-            for _ in range(per_chunk):
-                if index >= len(sizes):
-                    return out
-                out.append(data[offset:offset + sizes[index]])
-                offset += sizes[index]
-                index += 1
-    return out
-
-
-def parse_metadata(path):
-    """Frame times from the Winscope metadata track: {clock, frames, epoch_offset}."""
-    with open(path, "rb") as handle:
-        data = handle.read()
-    best = None
-    for kind, pos, header, size in boxes(data, 0, len(data)):
-        if kind != b"trak":
-            continue
-        handler, sizes, offsets, chunks = track_tables(data, pos + header, pos + size)
-        if handler != b"meta":
-            continue
-        for payload in track_samples(data, offsets, chunks, sizes):
-            # Version 2 first: the elapsed clock, which /proc/uptime also reports.
-            if payload.startswith(MAGIC_V2):
-                epoch_offset = struct.unpack("<q", payload[20:28])[0]
-                count = struct.unpack("<I", payload[28:32])[0]
-                stamps = struct.unpack("<%dQ" % count, payload[32:32 + 8 * count])
-                found = {"clock": "elapsed", "unit": 1e9, "frames": list(stamps),
-                         "epoch_offset_ns": epoch_offset}
-            elif payload.startswith(MAGIC_V1):
-                count = struct.unpack("<I", payload[16:20])[0]
-                stamps = struct.unpack("<%dQ" % count, payload[20:20 + 8 * count])
-                found = {"clock": "monotonic", "unit": 1e6, "frames": list(stamps)}
-            else:
-                continue
-            if found["frames"] and (best is None or found["clock"] == "elapsed"):
-                best = found
-    if best is None:
-        return None
-    frames = best["frames"]
-    if any(b < a for a, b in zip(frames, frames[1:])):
-        sys.exit("capture: the metadata track's frame times are not in order")
-    return best
-
-
-def container_pts(path):
-    """The container's own pts per frame, in presentation order, or nothing.
-
-    No ffprobe on this machine, or a file it cannot read, is a recording without
-    container times rather than a failure: the frame index and the metadata
-    track's own times still say which picture was on screen.
-    """
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-             "frame=pts_time", "-of", "csv=p=0", path],
-            capture_output=True, text=True)
-    except OSError:
-        return []
-    if result.returncode != 0:
-        return []
-    stamps = []
-    for line in result.stdout.split():
-        try:
-            stamps.append(float(line))
-        except ValueError:
-            pass
-    return stamps
-
-
-# --- commands ----------------------------------------------------------------
-
 
 def load_state(directory):
     path = os.path.join(directory, STATE)
@@ -254,37 +94,36 @@ def cmd_start(args):
     serial = args.serial or os.environ.get("ANDROID_SERIAL", "")
     if adb(["get-state"], serial).returncode != 0:
         sys.exit("capture: no device (set ANDROID_SERIAL or --serial)")
-    device_shell("rm -f %s" % REMOTE, serial)
-    # A leftover recorder from a dead run would hold the display's capture slot
-    # and would also be found by stop, so it is stopped before this one starts.
-    device_shell("pkill -INT screenrecord", serial)
     clock = sample_clock(serial)
     if clock is None:
         sys.exit("capture: could not read the device clock")
-    option = ""
-    if args.size:
-        option += " --size %s" % args.size
-    if args.bit_rate:
-        option += " --bit-rate %s" % args.bit_rate
-    # setsid + & so the recorder outlives this adb call: start and stop are
-    # separate commands, and the suite does not hold a client open for a run.
-    device_shell("setsid screenrecord --time-limit 0%s %s </dev/null >/dev/null 2>&1 &"
-                 % (option, REMOTE), serial)
-    running = False
-    for _ in range(40):
-        if device_shell("pidof screenrecord", serial).returncode == 0:
-            running = True
-            break
-        time.sleep(0.05)
-    if not running:
-        sys.exit("capture: screenrecord did not start")
-    state = {"remote": REMOTE, "serial": serial, "started": time.time(),
-             "host_clock": host_clock(), "clock": [clock],
-             "size": args.size or "native", "bit_rate": args.bit_rate or "default"}
+    chosen = args.source
+    if chosen == "auto":
+        # The stream is one encoder for a viewer, so it costs less than screenrecord
+        # on the device; when it cannot run, this is the recording that always can.
+        try:
+            extra = Stream().start(args, serial)
+            chosen = "stream"
+        except SourceUnavailable as why:
+            print("capture: %s; falling back to screenrecord" % why)
+            chosen = "screenrecord"
+            try:
+                extra = Screenrecord().start(args, serial)
+            except SourceUnavailable as failed:
+                sys.exit("capture: %s" % failed)
+    else:
+        try:
+            extra = STRATEGIES[chosen]().start(args, serial)
+        except SourceUnavailable as why:
+            sys.exit("capture: %s" % why)
+    state = {"source": chosen, "serial": serial, "started": time.time(),
+             "host_clock": host_clock(), "clock": [clock]}
+    state.update(extra)
     save_state(args.dir, state)
     with open(os.path.join(args.dir, EVENTS), "w") as handle:
         handle.write(json.dumps({"name": "record:start", "host": host_clock()}) + "\n")
-    print("capture: recording to the device, events in %s" % os.path.join(args.dir, EVENTS))
+    print("capture: %s recording, events in %s"
+          % (chosen, os.path.join(args.dir, EVENTS)))
 
 
 def cmd_event(args):
@@ -306,25 +145,17 @@ def cmd_stop(args):
     state = load_state(args.dir)
     serial = state.get("serial", "")
     stop_sampled = sample_clock(serial)
-    device_shell("pkill -INT screenrecord", serial)
-    for _ in range(100):
-        if device_shell("pidof screenrecord", serial).returncode != 0:
-            break
-        time.sleep(0.05)
-    else:
-        sys.exit("capture: screenrecord would not stop")
-    recording = os.path.join(args.dir, RECORDING)
-    pull = adb(["pull", state["remote"], os.path.abspath(recording)], serial)
-    if pull.returncode != 0:
-        sys.exit("capture: could not pull the recording: %s" % pull.stderr.strip())
-    device_shell("rm -f %s" % state["remote"], serial)
-    # The file screenrecord closes is used as it is. It already keeps `moov`
-    # before `mdat`, so seeking it is a seek, and its metadata track carries the
-    # per-frame times: remuxing it through ffmpeg would drop that track and make
-    # the recording stop explaining itself.
-    meta = parse_metadata(recording)
+    name = state.get("source", "screenrecord")
+    strategy = STRATEGIES.get(name, Screenrecord)()
+    recording, meta, extra = strategy.stop(args, state, serial)
+    return finish(args, state, recording, meta, stop_sampled, extra)
+
+
+def finish(args, state, recording, meta, stop_sampled, extra=None):
+    """The sidecar both strategies end with: frame times, then the events on them."""
     pts = container_pts(recording)
     sidecar = {"recording": os.path.basename(recording),
+               "source": state.get("source", "screenrecord"),
                "size": os.path.getsize(recording),
                "duration": pts[-1] - pts[0] if len(pts) > 1 else 0.0,
                "events": [], "frames": []}
@@ -332,12 +163,19 @@ def cmd_stop(args):
         state["clock"].append(stop_sampled)
     if meta is None:
         sidecar["sync"] = {"clock": "none", "accuracy_ms": None,
-                           "why": "this screenrecord wrote no metadata track"}
+                           "why": (extra or {}).get("why")
+                                  or "this recording has no per-frame times"}
     else:
         sidecar["frames"] = meta["frames"]
         sidecar["sync"] = {"clock": meta["clock"], "unit_ns": int(meta["unit"]),
                            "frame_count": len(meta["frames"]),
                            "epoch_offset_ns": meta.get("epoch_offset_ns")}
+        if meta.get("base_ns") is not None:
+            # A stream's frames are its own pts plus this base, so the file that
+            # produced them is in the sidecar too: the mapping explains itself.
+            sidecar["sync"]["base_ns"] = meta["base_ns"]
+        if extra:
+            sidecar["sync"].update(extra)
         clocks = state.get("clock") or []
         if clocks:
             offsets = [sample["offset"] for sample in clocks]
@@ -536,6 +374,13 @@ def main(argv=None):
     start.add_argument("--serial", default="")
     start.add_argument("--size", default="", help="WxH; native by default")
     start.add_argument("--bit-rate", dest="bit_rate", default="6M")
+    # screenstream is the recording to prefer: one hardware encode, times on the
+    # device's clock, and no second process competing for the display. screenrecord
+    # is what records when it cannot run, and neither is required by the other.
+    start.add_argument("--source", choices=("auto", "stream", "screenrecord"),
+                       default="auto",
+                       help="how to record: screenstream, falling back to "
+                            "screenrecord (default); stream; screenrecord")
     start.set_defaults(run=cmd_start)
 
     event = with_dir(sub.add_parser("event", help="mark a moment; no adb call"))
@@ -557,6 +402,13 @@ def main(argv=None):
     frames.add_argument("--recording", default="")
     frames.add_argument("--sidecar", default="")
     frames.set_defaults(run=cmd_frames)
+
+    # The stream subscriber, started by `start` and stopped by `stop`.
+    read = with_dir(sub.add_parser(
+        "read", help="write the stream to the directory; start runs this"))
+    read.add_argument("--host", default="127.0.0.1")
+    read.add_argument("--port", type=int, default=STREAM_PORT)
+    read.set_defaults(run=cmd_read)
 
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     # `--dir` is accepted on either side of the verb; the shell writes it after.

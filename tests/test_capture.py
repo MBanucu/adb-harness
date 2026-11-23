@@ -298,5 +298,81 @@ class FrameCommandTest(unittest.TestCase):
         self.assertEqual(command[command.index("-ss") + 1], "0.000000")
 
 
+class StreamBaseTest(unittest.TestCase):
+    """What screenstream's init segment says about the device clock."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def write(self, base_ns=51_000_000_000, uuid=None, version=1):
+        parts = [box(b"mvhd", FULL)]
+        if base_ns is not None:
+            parts.append(box(b"udta", box(
+                b"uuid", uuid or capture.BASE_UUID,
+                struct.pack(">IIQ", version, 0, base_ns))))
+        path = os.path.join(self.directory.name, "live.mp4")
+        with open(path, "wb") as handle:
+            handle.write(box(b"ftyp", b"isom", b"\0\0\2\0", b"isomiso5avc1mp41")
+                         + box(b"moov", *parts))
+        return path
+
+    def test_the_init_segment_says_when_the_track_starts(self):
+        self.assertEqual(capture.stream_base(self.write()), 51_000_000_000)
+
+    def test_a_stream_from_another_writer_has_no_base(self):
+        self.assertIsNone(capture.stream_base(self.write(base_ns=None)))
+
+    def test_another_writers_uuid_is_not_ours(self):
+        self.assertIsNone(capture.stream_base(self.write(uuid=b"\1" * 16)))
+
+    def test_a_version_it_does_not_know_is_ignored(self):
+        self.assertIsNone(capture.stream_base(self.write(version=2)))
+
+
+class StrategyTest(unittest.TestCase):
+    """Which way of recording is chosen, and what happens when it cannot run."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+
+    def start(self, source, stream_says=None, expect_exit=False):
+        args = mock.Mock(dir=self.directory.name, serial="S", size="",
+                         bit_rate="6M", source=source)
+        stream = (mock.patch.object(capture.Stream, "start", side_effect=stream_says)
+                  if stream_says is not None
+                  else mock.patch.object(capture.Stream, "start",
+                                         return_value={"reader_pid": 1234}))
+        with mock.patch.object(capture, "adb",
+                               return_value=mock.Mock(returncode=0)), \
+                mock.patch.object(capture, "sample_clock",
+                                  return_value={"offset": 0.0, "error": 0.0}), \
+                mock.patch.object(capture, "host_clock", return_value=1.0), \
+                mock.patch.object(capture.Screenrecord, "start",
+                                  return_value={"remote": capture.REMOTE}), \
+                stream:
+            if expect_exit:
+                with self.assertRaises(SystemExit):
+                    capture.cmd_start(args)
+                return None
+            capture.cmd_start(args)
+        with open(os.path.join(self.directory.name, capture.STATE)) as handle:
+            return json.load(handle)
+
+    def test_the_stream_is_the_default_and_leaves_a_reader_behind(self):
+        state = self.start("auto")
+        self.assertEqual(state["source"], "stream")
+        self.assertEqual(state["reader_pid"], 1234)
+
+    def test_a_stream_that_cannot_run_falls_back_to_screenrecord(self):
+        state = self.start("auto", capture.SourceUnavailable("no app"))
+        self.assertEqual(state["source"], "screenrecord")
+        self.assertNotIn("reader_pid", state)
+
+    def test_asking_for_the_stream_alone_does_not_fall_back(self):
+        self.start("stream", capture.SourceUnavailable("no app"), expect_exit=True)
+
+
 if __name__ == "__main__":
     unittest.main()

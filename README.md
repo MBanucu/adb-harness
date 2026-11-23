@@ -17,7 +17,7 @@ pip install "adb-harness[mdns]"   # and python-zeroconf, which adb-connect needs
 |---|---|---|
 | `adb-connect` | finds the wireless-debugging port over mDNS and runs `adb connect` | `adb`, `zeroconf` |
 | `adb-watch` | loop that reconnects whenever the device list goes empty | `adb`, `adb-connect` |
-| `capture` | one `screenrecord` for a run, an event beside each moment, and the exact frame for an event | `adb`, `ffmpeg` |
+| `capture` | one recording for a run, an event beside each moment, and the exact frame for an event | `adb`, `ffmpeg`, screenstream (optional) |
 
 ## adb-connect
 
@@ -53,9 +53,9 @@ default `out/` in the working directory) and `ADB_WATCH_LOG` change that.
 ## capture
 
 ```sh
-capture start --dir out/capture     # one screenrecord for the run
+capture start --dir out/capture     # one recording for the run
 capture event session:typed         # mark a moment; no adb call
-capture stop                        # stop, pull, and map events to frames
+capture stop                        # stop, and map events to frames
 capture show                        # every event of a recording, with its frame
 capture frames --event session:typed --out out/frames
 capture frames --at 12.5,40 --out out/frames
@@ -64,13 +64,24 @@ capture frames --at 12.5,40 --out out/frames
 `stop` keeps the video, the events and a sidecar in `--dir`; `frames` takes a
 single frame out of the recording when somebody asks, which is what a screenshot
 is for once the run is over. The mapping is exact rather than "the video starts
-when I pressed start": `screenrecord` writes the presentation time of every frame
-in the device's elapsed-realtime clock into a metadata track beside the video,
-which is the same clock `/proc/uptime` reports, so a moment logged on this side
-becomes the frame that was on screen then. `frames` needs `ffmpeg` on `PATH`;
-`stop` says what the offset between the two clocks was, and where the device is
-older than that metadata track (Android 12 and older) it falls back to the
-recording's own start and says so.
+when I pressed start": every frame carries its presentation time in the device's
+elapsed-realtime clock, which is the same clock `/proc/uptime` reports, so a
+moment logged on this side becomes the frame that was on screen then.
+
+Two ways to record, one mapping. `start` prefers **screenstream**: it brings the
+app up, subscribes to its H.264 stream, and `stop` saves what arrived as a
+fragmented MP4 — one hardware encode, no second process competing for the
+display, and the device time in the file's own init segment. When that cannot
+run (app not installed, projection not granted, port silent) it falls back to the
+device's **screenrecord** and says why; `--source stream` or `--source
+screenrecord` pins one, and `--source auto` is the default. `screenrecord` writes
+its frame times into a metadata track beside the video instead, so the sidecar's
+`sync` block differs in one field (`base_ns` for the stream, the track's own
+`epoch_offset_ns` for screenrecord) while the events come out the same.
+
+`frames` needs `ffmpeg` on `PATH`; `stop` says what the offset between the two
+clocks was, and where the device is older than that metadata track (Android 12
+and older) screenrecord itself has no per-frame times to offer.
 
 ## From a checkout
 
