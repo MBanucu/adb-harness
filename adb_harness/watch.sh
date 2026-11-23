@@ -57,7 +57,13 @@ while [ $# -gt 0 ]; do
 done
 
 case $interval in
-    ''|*[!0-9.]*) echo "adb-watch: --interval wants seconds" >&2; exit 2 ;;
+    ''|*[!0-9.]*|*.*.*) echo "adb-watch: --interval wants seconds" >&2; exit 2 ;;
+esac
+# A dot on its own passes the check above but `sleep` refuses it, and the loop
+# would then retry with no pause at all.
+case $interval in
+    *[0-9]*) : ;;
+    *) echo "adb-watch: --interval wants seconds" >&2; exit 2 ;;
 esac
 case $max_attempts in
     ''|*[!0-9]*) echo "adb-watch: --max-attempts wants a whole number" >&2; exit 2 ;;

@@ -485,7 +485,10 @@ exit 1
         self.assertEqual(self.run_watch("--wat").returncode, 2)
 
     def test_a_bad_interval_is_a_usage_error(self):
-        self.assertEqual(self.run_watch("--interval", "soon").returncode, 2)
+        # `sleep` refuses these, and an empty retry loop would hammer adb.
+        for value in ("soon", ".", "1.2.3"):
+            self.assertEqual(self.run_watch("--interval", value).returncode,
+                             2, value)
 
     def test_version_is_printed(self):
         code, out, _ = run_main(watch, ["--version"])
