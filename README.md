@@ -19,6 +19,52 @@ pip install "adb-harness[mdns]"   # and python-zeroconf, which adb-connect needs
 | `adb-watch` | loop that reconnects whenever the device list goes empty | `adb`, `adb-connect` |
 | `capture` | one recording for a run, an event beside each moment, and the exact frame for an event | `adb`, `ffmpeg`, screenstream (optional) |
 
+## Use as a library
+
+The same three commands are importable, and the library path does not print:
+return values and the exceptions in `adb_harness.errors` are the contract. This
+is for a test suite that wants to embed the recorder instead of forking it.
+
+```python
+from adb_harness import capture, connect
+
+port = connect.find(timeout=8)          # Port | None
+result = connect.connect(port)          # ConnectResult(serial, address, already)
+
+with capture.Session(dir="out/capture", serial=result.serial) as run:
+    run.event("check:diag")             # a file append: no process, no adb call
+    frames = run.stop()                 # Recording(video, sidecar, events)
+    frame = frames.frame_for("check:diag")
+```
+
+`connect.find` returns a `Port(address, port, serial, source)`, or `None` when
+nothing is advertised; `source` is `mdns`, `port` (named with `port=...`) or
+`attached`. `connect.connect` returns a `ConnectResult(serial, address, already)`
+and does nothing to adb when the port is already attached. `find` and `connect`
+raise `NoAdb` when adb is missing, `NoMdns` when python-zeroconf is, and
+`NotConnected` when no address answers.
+
+`capture.Session` owns start, event and stop. `event(name, data=None)` appends
+one line, so a hundred moments cost a hundred appends and no adb calls.
+`stop()` returns a `Recording`: `video` and `sidecar` are paths, `events` is the
+mapped list, `data` is the sidecar dict, and `frame_for(name)` is the first
+mapped event of that name (`frames_for` keeps every moment of a repeated name).
+Stop raises `CaptureFailed` instead of exiting. ffmpeg is only needed by
+`capture frames`, not by recording or mapping.
+
+`watch.Watcher(interval=15, max_attempts=0, on_event=None)` is the reconnect loop
+as an object: `.run()` blocks until `.stop()` or the attempt bound, `.status()`
+returns `WatchStatus(running, pid, devices, attempts)`, and `on_event` receives a
+`WatchEvent` for each state change. `adb_harness/watch.sh` is only a caller of
+this module now.
+
+A serial is what makes two attached devices unambiguous. It can be passed to
+`connect.find`, `capture.Session`/`Session.stop`, and every command:
+`adb-connect --serial S`, `adb-watch --serial S`, and
+`capture start --serial S` (also accepted after any capture verb). The commands
+still keep their documented output and exit codes; only the library skips the
+printing.
+
 ## adb-connect
 
 ```sh
@@ -27,6 +73,7 @@ adb-connect --pair        # same lookup, for the pairing port
 adb-connect --port 38109  # skip discovery
 adb-connect --json        # one JSON object on stdout, for a harness
 adb-connect --quiet       # no progress lines; the final output still prints
+adb-connect --serial S    # prefer this device when more than one is attached
 adb-connect --version     # print the version and exit
 ```
 
@@ -47,6 +94,7 @@ adb-watch --status               # is it running, and is a device attached
 adb-watch --status --json        # the same, as one JSON object
 adb-watch --json                 # one JSON object per state change
 adb-watch --interval 5 --max-attempts 10
+adb-watch --serial S             # watch one device when several are attached
 kill "$(cat out/adb-watch.pid)"  # stop a running watcher
 ```
 
@@ -63,6 +111,7 @@ and `1` if not. `--quiet` leaves the log alone but still writes the JSON objects
 
 ```sh
 capture start --dir out/capture     # one recording for the run
+capture start --serial S            # the device to record, when two are attached
 capture start --json                # {"recording":true,"source":"...","dir":"..."}
 capture event session:typed         # mark a moment; no adb call
 capture stop                        # stop, and map events to frames
@@ -72,6 +121,11 @@ capture frames --event session:typed --out out/frames
 capture frames --at 12.5,40 --out out/frames
 capture --version                   # print the version and exit
 ```
+
+Every capture subcommand accepts `--serial` (before or after the verb). `start`
+records it and `stop` uses it, so two attached devices are not ambiguous;
+`event`, `show` and `frames` accept it for a caller that writes one command line
+shape.
 
 `stop` keeps the video, the events and a sidecar in `--dir`; `frames` takes a
 single frame out of the recording when somebody asks, which is what a screenshot
@@ -178,8 +232,9 @@ python3 -m adb_harness.connect --timeout 4
 python3 -m adb_harness.watch --status
 ```
 
-and `bash adb_harness/watch.sh` runs the watcher without Python finding the
-package, falling back to `python3 -m adb_harness.connect` for reconnects.
+and `bash adb_harness/watch.sh` runs the same Python watcher from a checkout. The
+script is only a caller now: it finds the package and runs
+`python3 -m adb_harness.watch` with the arguments it was given.
 
 ## Tests
 
