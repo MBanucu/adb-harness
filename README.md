@@ -242,22 +242,28 @@ script is only a caller now: it finds the package and runs
 python3 -m unittest discover -s tests -v
 ```
 
-The mapping is arithmetic over a recording, so it has a test suite that needs no
-phone: `tests/test_capture.py` builds a synthetic MP4 of the shape `screenrecord`
-writes — an `ftyp`, a `moov` with a metadata track whose one sample is a Winscope
-payload, and that sample in `mdat` — and checks what an event becomes against it:
-the frame that was on screen, how long before the event it appeared, the container
-time it gets, events the device timed itself (which take no offset), events before
-the first frame and after the last, and a container whose frame list disagrees
-with the metadata track. The parser is covered the same way: both magic versions,
-the elapsed clock winning over the monotonic one, no metadata track at all, frame
-times out of order, and a truncated file.
+Everything under `tests/` runs without a phone, adb on `PATH` or a network.
+`tests/fakeadb.py` writes an `adb` (and `adb-connect`) executable into the test's
+`TemporaryDirectory` and puts it first on `PATH`; a JSON scenario says what
+`devices`, `connect`, `get-state` and a device shell answer, and a successful
+connect updates the device table the next call sees. Each test file covers one
+module:
 
-What needs a device — recording, pulling, extracting frames, reconnecting — is
-checked where the tools are used, in `android-accessible-terminal`'s e2e suite.
-CI also builds the package on every push and installs the wheel and the sdist in a
-fresh virtualenv, because tests against the checkout cannot see a wheel with the
-wrong entry points or a missing `watch.sh`.
+| file | module it covers |
+|---|---|
+| `tests/test_capture.py` | `capture.py`'s event-to-frame mapping, over a synthetic MP4 of the shape `screenrecord` writes: an `ftyp`, a `moov` with a metadata track whose one sample is a Winscope payload, and that sample in `mdat`. Checks the frame that was on screen, how long before the event it appeared, the container time it gets, events the device timed itself, events before the first and after the last frame, a container and metadata track that disagree, both magic versions, the elapsed clock winning over the monotonic one, no metadata track, frame times out of order, and a truncated file. |
+| `tests/test_connect_deviceless.py` | `connect.py`'s `attached`, `adb`, `discover`, `find` and `connect`. The fake adb covers a device table with offline and unauthorised entries, an already-attached device, a named serial, and the `stale-port` and `no-service` JSON reasons. Real `zeroconf.ServiceInfo` objects fed through `discover`'s callback cover the connect service winning over the pairing one, a phone advertising its own loopback address, no service within the timeout, and two advertised phones where the one that answers wins. Those cases skip with the reason when the optional `zeroconf` extra is not installed; the fake-adb cases do not need it. |
+| `tests/test_watch_deviceless.py` | `watch.py`'s `Watcher` and `--status`. Three ticks at a millisecond interval cover one `adb-connect` per tick with no device, a repeated failure whose log line waits ten minutes, a device that appears causing an attached exit, the JSON state-change stream, and status with a live pidfile, no pidfile and a stale one. |
+| `tests/test_capture_lifecycle.py` | `capture.py`'s `Session` order: `stop` with no `start`, two `start`s on one session, an event before `start` (raised by the library, a no-op from the command), `show` with no recording, and a sidecar whose video is missing, each with the documented error or exit code. |
+| `tests/test_library.py` | the library surface of `connect`, `capture.Session` and `watch.Watcher`: return values, exceptions, an event that costs no process, and a watcher asked about in process. |
+| `tests/test_cli.py` | the commands' machine-readable output, exit codes and unchanged prose, with adb and mDNS replaced by Mocks. |
+
+What needs a real device — recording, pulling, extracting frames, reconnecting
+after a reboot — is checked where the tools are used, in
+`android-accessible-terminal`'s e2e suite. CI also builds the package on every
+push and installs the wheel and the sdist in a fresh virtualenv, because tests
+against the checkout cannot see a wheel with the wrong entry points or a missing
+`watch.sh`.
 
 ## Releasing
 
