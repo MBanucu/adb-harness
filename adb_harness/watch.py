@@ -17,9 +17,16 @@ import subprocess
 import sys
 from importlib import resources
 
+from . import __version__
+
+VERSION = "adb-watch %s" % __version__
+
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    if "--version" in argv:
+        print(VERSION)
+        return 0
     script = resources.files("adb_harness").joinpath("watch.sh")
 
     env = dict(os.environ)

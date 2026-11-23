@@ -27,11 +27,17 @@ import subprocess
 import sys
 import time
 
+from . import __version__
+from .output import EXIT_FAILURE, EXIT_PREREQUISITE, emit
+
 # What a phone with Wireless debugging on advertises. `_adb._tcp` is the older
 # (pre-TLS) discovery record; asking for both costs nothing and covers a phone
 # that still publishes it.
 CONNECT_SERVICES = ("_adb-tls-connect._tcp.local.", "_adb._tcp.local.")
 PAIRING_SERVICE = "_adb-tls-pairing._tcp.local."
+
+SCHEMA = "adb-connect"
+VERSION = "adb-connect %s" % __version__
 
 
 def adb(*args):
@@ -146,6 +152,19 @@ def connect(info):
     return None, f"{where}: {said}"
 
 
+def port_of(serial):
+    """The port in `host:port`, or 0 for a serial that is not an address."""
+    _, _, tail = serial.rpartition(":")
+    return int(tail) if tail.isdigit() else 0
+
+
+def failure(args, reason, detail, port=None, code=EXIT_FAILURE):
+    """The failure shape: one object on stdout when asked for JSON."""
+    if args.json:
+        emit(SCHEMA, ok=False, reason=reason, detail=detail, port=port)
+    return code
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Find the wireless-debugging port over mDNS and connect adb.")
@@ -155,55 +174,103 @@ def main(argv=None):
                         help="connect to 127.0.0.1 at this port instead of asking mDNS")
     parser.add_argument("--pair", action="store_true",
                         help="print the pairing command instead of connecting")
+    parser.add_argument("--json", action="store_true",
+                        help="print one JSON object on stdout instead of prose")
+    parser.add_argument("--quiet", action="store_true",
+                        help="no progress lines; the final output is still printed")
+    parser.add_argument("--version", action="version", version=VERSION)
     args = parser.parse_args(argv)
 
     if shutil.which("adb") is None:
+        if args.json:
+            return failure(args, "no-adb", "adb is not in PATH",
+                           code=EXIT_PREREQUISITE)
         print("adb is not in PATH", file=sys.stderr)
-        return 1
+        return EXIT_PREREQUISITE
     try:
         import zeroconf  # noqa: F401
     except ImportError:
+        if args.json:
+            return failure(args, "no-mdns",
+                           "python-zeroconf is missing: pip install zeroconf",
+                           code=EXIT_PREREQUISITE)
         print("python-zeroconf is missing: pip install zeroconf", file=sys.stderr)
-        return 1
+        return EXIT_PREREQUISITE
 
     if args.port is None:
         devices = attached()
         if devices and not args.pair:
-            print(f"already connected: {', '.join(devices)}")
+            if args.json:
+                serial = devices[0]
+                emit(SCHEMA, ok=True, address=serial, port=port_of(serial),
+                     serial=serial, source="attached", waited_s=0.0)
+            else:
+                print(f"already connected: {', '.join(devices)}")
             return 0
 
-        print(f"asking mDNS for the wireless-debugging port ({args.timeout:g}s)…")
+        if not (args.json or args.quiet):
+            print(f"asking mDNS for the wireless-debugging port ({args.timeout:g}s)…")
+        started = time.monotonic()
         found, pairing = discover(args.timeout)
+        waited = round(time.monotonic() - started, 3)
 
         if args.pair:
             if not pairing:
+                if args.json:
+                    return failure(args, "no-service",
+                                   "no pairing service advertised")
                 print("no pairing service advertised. Turn Wireless debugging on,")
                 print("then tap \"Pair device with pairing code\" and try again.")
-                return 1
-            for info in pairing:
-                print(f"adb pair {target(addresses(info)[0], info.port)}")
+                return EXIT_FAILURE
+            targets = [target(addresses(info)[0], info.port) for info in pairing]
+            if args.json:
+                emit(SCHEMA, ok=True, address=targets[0],
+                     port=port_of(targets[0]), serial="", source="pairing",
+                     waited_s=waited,
+                     pairing=[{"address": where, "command": f"adb pair {where}"}
+                              for where in targets])
+            else:
+                for where in targets:
+                    print(f"adb pair {where}")
             return 0
 
         if not found:
+            if args.json:
+                return failure(
+                    args, "no-service",
+                    "nothing advertised " + " or ".join(CONNECT_SERVICES))
             print("nothing advertised " + " or ".join(CONNECT_SERVICES), file=sys.stderr)
             print("Wireless debugging is off, or its port was not picked up yet.", file=sys.stderr)
             if pairing:
                 for info in pairing:
                     print(f"the phone is pairing: adb pair "
                           f"{target(addresses(info)[0], info.port)}", file=sys.stderr)
-            return 1
+            return EXIT_FAILURE
 
         # A phone paired once usually advertises one service; a stale record for
         # an old port can still be around, so every candidate is tried.
+        detail = ""
         for info in found:
             where, said = connect(info)
             if where is not None:
-                print(f"connected to {where}")
-                print(f"  advertised as {info.name}")
-                for serial in attached():
-                    print(f"  device: {serial}")
+                serials = attached()
+                serial = where if where in serials else (serials[0] if serials else "")
+                if args.json:
+                    emit(SCHEMA, ok=True, address=where, port=info.port,
+                         serial=serial, source="mdns", waited_s=waited)
+                else:
+                    print(f"connected to {where}")
+                    print(f"  advertised as {info.name}")
+                    for serial in serials:
+                        print(f"  device: {serial}")
                 return 0
-            print(said, file=sys.stderr)
+            detail = said
+            if not args.json:
+                print(said, file=sys.stderr)
+        if args.json:
+            return failure(args, "stale-port",
+                           detail or "the advertised port did not answer",
+                           port=found[-1].port if found else None)
         print(file=sys.stderr)
         print("The phone advertises a port, but nothing answers on it. Wireless",
               file=sys.stderr)
@@ -212,15 +279,24 @@ def main(argv=None):
         print("Turn Wireless debugging off and on in Developer options, then",
               file=sys.stderr)
         print("run this again.", file=sys.stderr)
-        return 1
+        return EXIT_FAILURE
 
     where = target("127.0.0.1", args.port)
     said = adb("connect", where)
-    print(said)
+    if not (args.json or args.quiet):
+        print(said)
     devices = attached()
     if not devices:
-        return 1
-    print(f"connected to {where}")
+        if args.json:
+            return failure(args, "stale-port", f"{where}: {said}",
+                           port=args.port)
+        return EXIT_FAILURE
+    serial = where if where in devices else devices[0]
+    if args.json:
+        emit(SCHEMA, ok=True, address=where, port=args.port, serial=serial,
+             source="port", waited_s=0.0)
+    else:
+        print(f"connected to {where}")
     return 0
 
 

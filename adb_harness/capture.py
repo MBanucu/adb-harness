@@ -63,18 +63,42 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 
+from . import __version__
 from .device import adb, device_shell, host_clock, sample_clock  # noqa: F401
 from .mp4 import MAGIC_V1, MAGIC_V2, boxes, container_pts, parse_metadata  # noqa: F401
 from .errors import SourceUnavailable  # noqa: F401
+from .output import EXIT_FAILURE, EXIT_PREREQUISITE, EXIT_USAGE, emit
 from .sources import (BASE_UUID, REMOTE, STRATEGIES, RECORDING, STREAM_PORT,  # noqa: F401
                       Screenrecord, Stream, cmd_read, stream_base)
 
 STATE = "capture.json"
 EVENTS = "events.jsonl"
+SCHEMA_START = "capture-start"
+SCHEMA_RECORDING = "capture-recording"
+VERSION = "capture %s" % __version__
+
+
+def wants_json(args):
+    """Only a parsed `--json`, not any truthy attribute a test's Mock carries."""
+    return getattr(args, "json", False) is True
+
+
+def quiet(args):
+    return getattr(args, "quiet", False) is True
+
+
+def fail(args, schema, reason, message, code):
+    if wants_json(args):
+        emit(schema, ok=False, reason=reason, detail=message)
+    else:
+        print(message, file=sys.stderr)
+    return code
+
 
 def load_state(directory):
     path = os.path.join(directory, STATE)
@@ -91,13 +115,19 @@ def save_state(directory, state):
 
 
 def cmd_start(args):
+    if shutil.which(os.environ.get("ADB", "adb")) is None:
+        return fail(args, SCHEMA_START, "no-adb", "capture: adb is not in PATH",
+                    EXIT_PREREQUISITE)
     os.makedirs(args.dir, exist_ok=True)
     serial = args.serial or os.environ.get("ANDROID_SERIAL", "")
     if adb(["get-state"], serial).returncode != 0:
-        sys.exit("capture: no device (set ANDROID_SERIAL or --serial)")
+        return fail(args, SCHEMA_START, "no-device",
+                    "capture: no device (set ANDROID_SERIAL or --serial)",
+                    EXIT_FAILURE)
     clock = sample_clock(serial)
     if clock is None:
-        sys.exit("capture: could not read the device clock")
+        return fail(args, SCHEMA_START, "no-device-clock",
+                    "capture: could not read the device clock", EXIT_FAILURE)
     chosen = args.source
     if chosen == "auto":
         # The stream is one encoder for a viewer, so it costs less than screenrecord
@@ -106,25 +136,33 @@ def cmd_start(args):
             extra = Stream().start(args, serial)
             chosen = "stream"
         except SourceUnavailable as why:
-            print("capture: %s; falling back to screenrecord" % why)
+            if not (wants_json(args) or quiet(args)):
+                print("capture: %s; falling back to screenrecord" % why)
             chosen = "screenrecord"
             try:
                 extra = Screenrecord().start(args, serial)
             except SourceUnavailable as failed:
-                sys.exit("capture: %s" % failed)
+                return fail(args, SCHEMA_START, "record-failed",
+                            "capture: %s" % failed, EXIT_FAILURE)
     else:
         try:
             extra = STRATEGIES[chosen]().start(args, serial)
         except SourceUnavailable as why:
-            sys.exit("capture: %s" % why)
+            return fail(args, SCHEMA_START, "record-failed",
+                        "capture: %s" % why, EXIT_FAILURE)
     state = {"source": chosen, "serial": serial, "started": time.time(),
              "host_clock": host_clock(), "clock": [clock]}
     state.update(extra)
     save_state(args.dir, state)
     with open(os.path.join(args.dir, EVENTS), "w") as handle:
         handle.write(json.dumps({"name": "record:start", "host": host_clock()}) + "\n")
-    print("capture: %s recording, events in %s"
-          % (chosen, os.path.join(args.dir, EVENTS)))
+    if wants_json(args):
+        emit(SCHEMA_START, recording=True, source=chosen, dir=args.dir,
+             serial=serial)
+    else:
+        print("capture: %s recording, events in %s"
+              % (chosen, os.path.join(args.dir, EVENTS)))
+    return 0
 
 
 def cmd_event(args):
@@ -143,6 +181,9 @@ def cmd_event(args):
 
 
 def cmd_stop(args):
+    if shutil.which(os.environ.get("ADB", "adb")) is None:
+        print("capture: adb is not in PATH", file=sys.stderr)
+        return EXIT_PREREQUISITE
     state = load_state(args.dir)
     serial = state.get("serial", "")
     stop_sampled = sample_clock(serial)
@@ -293,9 +334,16 @@ def cmd_show(args):
     directory = args.dir
     sidecar_path = os.path.join(directory, "recording.json")
     if not os.path.isfile(sidecar_path):
-        sys.exit("capture: no recording.json in %s (run stop first)" % directory)
+        return fail(args, SCHEMA_RECORDING, "no-recording",
+                    "capture: no recording.json in %s (run stop first)" % directory,
+                    EXIT_FAILURE)
     with open(sidecar_path) as handle:
         sidecar = json.load(handle)
+    if wants_json(args):
+        # The sidecar as it stands, so `capture frames --sidecar` accepts this
+        # written back to a file: one format, with the schema added to it.
+        emit(SCHEMA_RECORDING, **sidecar)
+        return 0
     print_summary(directory, sidecar)
     for event in sidecar.get("events") or []:
         if "frame" not in event:
@@ -317,21 +365,27 @@ def frame_command(recording, video_s, out):
 
 
 def cmd_frames(args):
+    if shutil.which("ffmpeg") is None:
+        print("capture: ffmpeg is not in PATH", file=sys.stderr)
+        return EXIT_PREREQUISITE
     directory = args.dir
     sidecar_path = args.sidecar or os.path.join(directory, "recording.json")
     if not os.path.isfile(sidecar_path):
-        sys.exit("capture: no recording.json; run stop first")
+        print("capture: no recording.json; run stop first", file=sys.stderr)
+        return EXIT_FAILURE
     with open(sidecar_path) as handle:
         sidecar = json.load(handle)
     recording = args.recording or os.path.join(directory, sidecar["recording"])
     if not os.path.isfile(recording):
-        sys.exit("capture: no recording at %s" % recording)
+        print("capture: no recording at %s" % recording, file=sys.stderr)
+        return EXIT_FAILURE
     events = sidecar.get("events") or []
     wanted = [name.strip() for name in (args.event or "").split(",") if name.strip()]
     missing = [name for name in wanted
                if not any(e["name"] == name and "video_s" in e for e in events)]
     if missing:
-        sys.exit("capture: no mapped event named: " + ", ".join(missing))
+        print("capture: no mapped event named: " + ", ".join(missing), file=sys.stderr)
+        return EXIT_USAGE
     picks = []
     if args.all:
         picks = [e for e in events if "video_s" in e]
@@ -342,9 +396,15 @@ def cmd_frames(args):
     for value in (args.at or "").split(","):
         value = value.strip()
         if value:
-            picks.append({"name": "at-%s" % value, "video_s": float(value)})
+            try:
+                picks.append({"name": "at-%s" % value, "video_s": float(value)})
+            except ValueError:
+                print("capture: --at wants seconds, not %r" % value, file=sys.stderr)
+                return EXIT_USAGE
     if not picks:
-        sys.exit("capture: say what to extract: --event NAME, --at SECONDS, or --all")
+        print("capture: say what to extract: --event NAME, --at SECONDS, or --all",
+              file=sys.stderr)
+        return EXIT_USAGE
     os.makedirs(args.out, exist_ok=True)
     for pick in picks:
         slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", pick["name"]).strip("-")
@@ -352,8 +412,9 @@ def cmd_frames(args):
         result = subprocess.run(frame_command(recording, pick["video_s"], out),
                                 capture_output=True, text=True)
         if result.returncode != 0:
-            sys.exit("capture: ffmpeg failed at %.3fs: %s"
-                     % (pick["video_s"], result.stderr.strip()))
+            print("capture: ffmpeg failed at %.3fs: %s"
+                  % (pick["video_s"], result.stderr.strip()), file=sys.stderr)
+            return EXIT_FAILURE
         print("%s  %.3fs  %s" % (out, pick["video_s"], pick.get("name", "")))
     return 0
 
@@ -362,6 +423,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Record a run once, keep the moments as events, extract "
                     "frames when asked.")
+    parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--dir", default="out/capture",
                         help="where the recording and its events live")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -369,6 +431,7 @@ def main(argv=None):
     def with_dir(parser, **kwargs):
         """Every subcommand takes --dir: the shell writes it after the verb."""
         parser.add_argument("--dir", dest="sub_dir", default="")
+        parser.add_argument("--version", action="version", version=VERSION)
         return parser
 
     start = with_dir(sub.add_parser("start", help="start recording the device's screen"))
@@ -386,6 +449,10 @@ def main(argv=None):
                        help="APK to install when the screenstream app is missing "
                             "(default: the latest GitHub release; CAPTURE_APK also "
                             "works)")
+    start.add_argument("--json", action="store_true",
+                       help="print one JSON object on stdout instead of prose")
+    start.add_argument("--quiet", action="store_true",
+                       help="no progress lines; the final output is still printed")
     start.set_defaults(run=cmd_start)
 
     event = with_dir(sub.add_parser("event", help="mark a moment; no adb call"))
@@ -397,6 +464,8 @@ def main(argv=None):
     stop.set_defaults(run=cmd_stop)
 
     show = with_dir(sub.add_parser("show", help="the mapped events of a recording"))
+    show.add_argument("--json", action="store_true",
+                      help="print the sidecar as one JSON object, with a schema")
     show.set_defaults(run=cmd_show)
 
     frames = with_dir(sub.add_parser("frames", help="extract frames, now"))
