@@ -20,14 +20,20 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # These talk to a device, so what can be checked without one is that the
-      # package imports, that each command builds its argument parser and answers
-      # --help, and that the shell one is syntax. The mapping is the exception:
-      # it is arithmetic over a recording, and tests/test_capture.py builds one.
+      # These talk to a device; the deviceless tests in tests/ fake adb, mDNS and
+      # the recorder's inputs. What CI checks before them is that the package
+      # imports, that each command builds its argument parser and answers
+      # --help, and that the shell one is syntax.
       - name: syntax
         run: |
           python3 -m compileall -q adb_harness
           bash -n adb_harness/watch.sh
+
+      - name: the mDNS tests' optional extra
+        # tests/test_connect_deviceless.py feeds discover's real callback path
+        # with ServiceInfo objects; without the extra those cases skip, so CI
+        # installs what the wheel calls adb-harness[mdns].
+        run: python -m pip install "zeroconf>=0.36"
 
       - name: unit tests
         run: python3 -W error::ResourceWarning -m unittest discover -s tests -v
