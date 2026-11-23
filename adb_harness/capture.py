@@ -13,6 +13,20 @@ script is the recording, the events, and the "extract that frame now" part.
     capture frames --at 12.5,40 --out out/frames
     capture show
 
+A test suite can skip the shell and keep the recording in process:
+
+    from adb_harness import capture
+
+    with capture.Session(dir="out/capture", serial=serial) as run:
+        run.event("check:diag")       # a file append: no process, no adb call
+        frames = run.stop()           # Recording(video, sidecar, events)
+        frame = frames.frame_for("check:diag")
+
+`Session.event` appends a line; `Session.stop` stops the recorder, maps the
+events to frames, writes the sidecar, and raises `CaptureFailed` when a step
+fails rather than exiting the process. ffmpeg is only needed to extract frames
+with `capture frames`, not to record or map them.
+
 Two ways to record, one mapping
 -------------------------------
 The recording is screenstream's H.264 stream when it can be had: `start` brings up
@@ -29,7 +43,7 @@ track - the same clock, a different place to read it from. Everything after
 the last frame at or before each event.
 
 Why the mapping is exact, and not "the video starts when I pressed start"
-------------------------------------------------------------------------
+-----------------------------------------------------------------------
 Both sources time every frame on the device's elapsed-realtime clock: the same
 clock `/proc/uptime` reports, so a moment logged on the device and a frame in the
 video are comparable numbers rather than two clocks to be eyeballed at each other.
@@ -67,17 +81,19 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 
 from . import __version__
 from .device import adb, device_shell, host_clock, sample_clock  # noqa: F401
+from .errors import CaptureFailed, NoAdb, NotConnected, SourceUnavailable  # noqa: F401
 from .mp4 import MAGIC_V1, MAGIC_V2, boxes, container_pts, parse_metadata  # noqa: F401
-from .errors import SourceUnavailable  # noqa: F401
 from .output import EXIT_FAILURE, EXIT_PREREQUISITE, EXIT_USAGE, emit
 from .sources import (BASE_UUID, REMOTE, STRATEGIES, RECORDING, STREAM_PORT,  # noqa: F401
                       Screenrecord, Stream, cmd_read, stream_base)
 
 STATE = "capture.json"
 EVENTS = "events.jsonl"
+SIDECAR = "recording.json"
 SCHEMA_START = "capture-start"
 SCHEMA_RECORDING = "capture-recording"
 VERSION = "capture %s" % __version__
@@ -103,7 +119,7 @@ def fail(args, schema, reason, message, code):
 def load_state(directory):
     path = os.path.join(directory, STATE)
     if not os.path.isfile(path):
-        sys.exit("capture: no recording in %s (run start first)" % directory)
+        raise CaptureFailed("no recording in %s (run start first)" % directory)
     with open(path) as handle:
         return json.load(handle)
 
@@ -114,54 +130,248 @@ def save_state(directory, state):
         json.dump(state, handle, indent=2)
 
 
-def cmd_start(args):
-    if shutil.which(os.environ.get("ADB", "adb")) is None:
-        return fail(args, SCHEMA_START, "no-adb", "capture: adb is not in PATH",
-                    EXIT_PREREQUISITE)
-    os.makedirs(args.dir, exist_ok=True)
-    serial = args.serial or os.environ.get("ANDROID_SERIAL", "")
-    if adb(["get-state"], serial).returncode != 0:
-        return fail(args, SCHEMA_START, "no-device",
-                    "capture: no device (set ANDROID_SERIAL or --serial)",
-                    EXIT_FAILURE)
-    clock = sample_clock(serial)
-    if clock is None:
-        return fail(args, SCHEMA_START, "no-device-clock",
-                    "capture: could not read the device clock", EXIT_FAILURE)
-    chosen = args.source
-    if chosen == "auto":
-        # The stream is one encoder for a viewer, so it costs less than screenrecord
-        # on the device; when it cannot run, this is the recording that always can.
-        try:
-            extra = Stream().start(args, serial)
-            chosen = "stream"
-        except SourceUnavailable as why:
-            if not (wants_json(args) or quiet(args)):
-                print("capture: %s; falling back to screenrecord" % why)
-            chosen = "screenrecord"
+def append_event(directory, name, data=None):
+    """One event line. A file append and nothing else: no process, no adb."""
+    record = {"name": name, "host": host_clock()}
+    if data:
+        record["data"] = {str(key): str(value) for key, value in data.items()}
+    with open(os.path.join(directory, EVENTS), "a") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+@dataclass(frozen=True)
+class Recording:
+    """What `Session.stop` produced.
+
+    `video` and `sidecar` are paths; `events` are the mapped event objects (the
+    sidecar's `events`), and `data` is the sidecar as a dict. `frame_for(name)`
+    is the first mapped event of that name, or None when nothing of that name was
+    marked (or it could not be mapped).
+    """
+
+    video: str
+    sidecar: str
+    events: tuple = ()
+    data: dict = field(default_factory=dict)
+
+    def frame_for(self, name):
+        """The first mapped event called `name`, or None."""
+        for event in self.events:
+            if event.get("name") == name and "frame" in event:
+                return event
+        return None
+
+    def frames_for(self, name):
+        """Every mapped event called `name`; a repeated name keeps every moment."""
+        return tuple(event for event in self.events
+                     if event.get("name") == name and "frame" in event)
+
+
+class Session:
+    """One recording, owned from start to stop.
+
+    `Session(dir=..., serial=...)` records the named device; the serial is what
+    makes a machine with two attached devices unambiguous. Use it as a context
+    manager and it stops itself, or call `stop()` for the `Recording`:
+
+        with capture.Session(dir="out/capture", serial="127.0.0.1:38109") as run:
+            run.event("check:diag")
+            frames = run.stop()
+            frame = frames.frame_for("check:diag")
+
+    The library path never prints. `on_note` receives the progress lines the
+    commands print (the fallback reason, a container/metadata frame-count
+    mismatch); with no callback they are dropped.
+    """
+
+    def __init__(self, dir="out/capture", serial="", *, source="auto", size="",
+                 bit_rate="6M", apk="", on_note=None):
+        self.dir = dir
+        self.serial = serial
+        self.source = source
+        self.size = size
+        self.bit_rate = bit_rate
+        self.apk = apk
+        self.on_note = on_note
+        self.state = {}
+        self._started = False
+        self._recording = None
+
+    def _note(self, message):
+        if self.on_note is not None:
+            self.on_note(message)
+
+    @staticmethod
+    def _require_adb():
+        if shutil.which(os.environ.get("ADB", "adb")) is None:
+            raise NoAdb("adb is not in PATH")
+
+    def start(self):
+        """Starts the recording and writes the state and the start event."""
+        if self._started:
+            raise CaptureFailed("this session is already recording")
+        self._require_adb()
+        os.makedirs(self.dir, exist_ok=True)
+        self.serial = self.serial or os.environ.get("ANDROID_SERIAL", "")
+        if adb(["get-state"], self.serial).returncode != 0:
+            raise NotConnected("no device (set ANDROID_SERIAL or --serial)")
+        clock = sample_clock(self.serial)
+        if clock is None:
+            raise CaptureFailed("could not read the device clock")
+        chosen = self.source
+        if chosen == "auto":
+            # The stream is one encoder for a viewer, so it costs less than
+            # screenrecord on the device; when it cannot run, this is the
+            # recording that always can.
             try:
-                extra = Screenrecord().start(args, serial)
-            except SourceUnavailable as failed:
-                return fail(args, SCHEMA_START, "record-failed",
-                            "capture: %s" % failed, EXIT_FAILURE)
-    else:
+                extra = Stream().start(self, self.serial)
+                chosen = "stream"
+            except SourceUnavailable as why:
+                self._note("capture: %s; falling back to screenrecord" % why)
+                chosen = "screenrecord"
+                try:
+                    extra = Screenrecord().start(self, self.serial)
+                except SourceUnavailable as failed:
+                    raise CaptureFailed(str(failed)) from None
+        else:
+            try:
+                extra = STRATEGIES[chosen]().start(self, self.serial)
+            except SourceUnavailable as why:
+                raise CaptureFailed(str(why)) from None
+        self.source = chosen
+        state = {"source": chosen, "serial": self.serial, "started": time.time(),
+                 "host_clock": host_clock(), "clock": [clock]}
+        state.update(extra)
+        save_state(self.dir, state)
+        with open(os.path.join(self.dir, EVENTS), "w") as handle:
+            handle.write(json.dumps({"name": "record:start", "host": host_clock()}) + "\n")
+        self.state = state
+        self._started = True
+        return self
+
+    def event(self, name, data=None):
+        """Marks a moment. A file append only: no process and no adb call."""
+        if self._recording is not None:
+            raise CaptureFailed("this session has already stopped")
+        if not self._started and not os.path.isfile(
+                os.path.join(self.dir, STATE)):
+            raise CaptureFailed("no recording in %s (run start first)" % self.dir)
+        append_event(self.dir, name, data)
+        return self
+
+    def stop(self, serial=None):
+        """Stops, pulls, maps, writes the sidecar, and returns the `Recording`."""
+        if self._recording is not None:
+            return self._recording
+        self._require_adb()
+        state = dict(self.state) if self.state else load_state(self.dir)
+        serial = serial or self.serial or state.get("serial", "")
+        stop_sampled = sample_clock(serial)
+        name = state.get("source", "screenrecord")
+        strategy = STRATEGIES.get(name, Screenrecord)()
         try:
-            extra = STRATEGIES[chosen]().start(args, serial)
-        except SourceUnavailable as why:
-            return fail(args, SCHEMA_START, "record-failed",
-                        "capture: %s" % why, EXIT_FAILURE)
-    state = {"source": chosen, "serial": serial, "started": time.time(),
-             "host_clock": host_clock(), "clock": [clock]}
-    state.update(extra)
-    save_state(args.dir, state)
-    with open(os.path.join(args.dir, EVENTS), "w") as handle:
-        handle.write(json.dumps({"name": "record:start", "host": host_clock()}) + "\n")
+            recording, meta, extra = strategy.stop(self, state, serial)
+        except SystemExit as stopped:
+            message = stopped.code if isinstance(stopped.code, str) else "capture failed"
+            raise CaptureFailed(message) from None
+        sidecar = self._finish(recording, state, meta, stop_sampled, extra)
+        self._recording = Recording(
+            video=recording,
+            sidecar=os.path.join(self.dir, SIDECAR),
+            events=tuple(sidecar.get("events") or ()),
+            data=sidecar)
+        return self._recording
+
+    def _finish(self, recording, state, meta, stop_sampled, extra=None):
+        """The sidecar both strategies end with: frame times, then the events on them."""
+        pts = container_pts(recording)
+        sidecar = {"recording": os.path.basename(recording),
+                   "source": state.get("source", "screenrecord"),
+                   "size": os.path.getsize(recording),
+                   "duration": pts[-1] - pts[0] if len(pts) > 1 else 0.0,
+                   "events": [], "frames": []}
+        if state.get("clock") and stop_sampled:
+            state["clock"].append(stop_sampled)
+        if meta is None:
+            sidecar["sync"] = {"clock": "none", "accuracy_ms": None,
+                               "why": (extra or {}).get("why")
+                                      or "this recording has no per-frame times"}
+        else:
+            sidecar["frames"] = meta["frames"]
+            sidecar["sync"] = {"clock": meta["clock"], "unit_ns": int(meta["unit"]),
+                               "frame_count": len(meta["frames"]),
+                               "epoch_offset_ns": meta.get("epoch_offset_ns")}
+            if meta.get("base_ns") is not None:
+                # A stream's frames are its own pts plus this base, so the file that
+                # produced them is in the sidecar too: the mapping explains itself.
+                sidecar["sync"]["base_ns"] = meta["base_ns"]
+            if extra:
+                sidecar["sync"].update(extra)
+            clocks = state.get("clock") or []
+            if clocks:
+                offsets = [sample["offset"] for sample in clocks]
+                errors = [sample["error"] for sample in clocks]
+                sidecar["sync"]["offset"] = sum(offsets) / len(offsets)
+                sidecar["sync"]["offset_samples"] = len(offsets)
+                # The spread of the samples is the honest error of the offset; half a
+                # round trip is the floor. A frame at 30 fps is 33 ms, so this says
+                # whether the mapping is frame accurate or only approximate.
+                sidecar["sync"]["offset_spread_ms"] = 1000.0 * (
+                    max(offsets) - min(offsets)) / 2.0
+                sidecar["sync"]["round_trip_ms"] = 1000.0 * sum(errors) / len(errors)
+            if pts and len(pts) != len(meta["frames"]):
+                # A count that differs means an index would point at the wrong
+                # picture; the timestamps are still good for --at.
+                self._note("capture: %d frames in the container, %d in the metadata: "
+                           "events keep their frame index, and --at still works"
+                           % (len(pts), len(meta["frames"])))
+        sidecar["events"] = map_events(self.dir, sidecar)
+        with open(os.path.join(self.dir, SIDECAR), "w") as handle:
+            json.dump(sidecar, handle, indent=2)
+        return sidecar
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._recording is not None:
+            return False
+        if exc_type is None:
+            self.stop()
+        else:
+            # Do not leave a recorder behind, but keep the exception that was
+            # already travelling to the caller.
+            try:
+                self.stop()
+            except Exception:
+                pass
+        return False
+
+
+def cmd_start(args):
+    session = Session(dir=args.dir, serial=getattr(args, "serial", ""),
+                      source=getattr(args, "source", "auto"),
+                      size=getattr(args, "size", ""),
+                      bit_rate=getattr(args, "bit_rate", "6M"),
+                      apk=getattr(args, "apk", ""),
+                      on_note=None if (wants_json(args) or quiet(args)) else print)
+    try:
+        session.start()
+    except NoAdb as why:
+        return fail(args, SCHEMA_START, "no-adb", "capture: %s" % why,
+                    EXIT_PREREQUISITE)
+    except NotConnected as why:
+        return fail(args, SCHEMA_START, "no-device", "capture: %s" % why,
+                    EXIT_FAILURE)
+    except CaptureFailed as why:
+        return fail(args, SCHEMA_START, "record-failed", "capture: %s" % why,
+                    EXIT_FAILURE)
     if wants_json(args):
-        emit(SCHEMA_START, recording=True, source=chosen, dir=args.dir,
-             serial=serial)
+        emit(SCHEMA_START, recording=True, source=session.source, dir=args.dir,
+             serial=session.serial)
     else:
         print("capture: %s recording, events in %s"
-              % (chosen, os.path.join(args.dir, EVENTS)))
+              % (session.source, os.path.join(args.dir, EVENTS)))
     return 0
 
 
@@ -171,74 +381,33 @@ def cmd_event(args):
         return 0
     if not os.path.isfile(os.path.join(directory, STATE)):
         return 0
-    record = {"name": args.name, "host": host_clock()}
+    data = {}
     for pair in args.data or []:
         key, _, value = pair.partition("=")
-        record.setdefault("data", {})[key.strip()] = value.strip()
-    with open(os.path.join(directory, EVENTS), "a") as handle:
-        handle.write(json.dumps(record) + "\n")
+        data[key.strip()] = value.strip()
+    append_event(directory, args.name, data)
     return 0
 
 
 def cmd_stop(args):
-    if shutil.which(os.environ.get("ADB", "adb")) is None:
-        print("capture: adb is not in PATH", file=sys.stderr)
+    session = Session(dir=args.dir, serial=getattr(args, "serial", ""),
+                      on_note=print)
+    try:
+        recording = session.stop()
+    except NoAdb as why:
+        print("capture: %s" % why, file=sys.stderr)
         return EXIT_PREREQUISITE
-    state = load_state(args.dir)
-    serial = state.get("serial", "")
-    stop_sampled = sample_clock(serial)
-    name = state.get("source", "screenrecord")
-    strategy = STRATEGIES.get(name, Screenrecord)()
-    recording, meta, extra = strategy.stop(args, state, serial)
-    return finish(args, state, recording, meta, stop_sampled, extra)
+    except CaptureFailed as why:
+        print("capture: %s" % why, file=sys.stderr)
+        return EXIT_FAILURE
+    print_summary(args.dir, recording.data)
+    return 0
 
 
 def finish(args, state, recording, meta, stop_sampled, extra=None):
-    """The sidecar both strategies end with: frame times, then the events on them."""
-    pts = container_pts(recording)
-    sidecar = {"recording": os.path.basename(recording),
-               "source": state.get("source", "screenrecord"),
-               "size": os.path.getsize(recording),
-               "duration": pts[-1] - pts[0] if len(pts) > 1 else 0.0,
-               "events": [], "frames": []}
-    if state.get("clock") and stop_sampled:
-        state["clock"].append(stop_sampled)
-    if meta is None:
-        sidecar["sync"] = {"clock": "none", "accuracy_ms": None,
-                           "why": (extra or {}).get("why")
-                                  or "this recording has no per-frame times"}
-    else:
-        sidecar["frames"] = meta["frames"]
-        sidecar["sync"] = {"clock": meta["clock"], "unit_ns": int(meta["unit"]),
-                           "frame_count": len(meta["frames"]),
-                           "epoch_offset_ns": meta.get("epoch_offset_ns")}
-        if meta.get("base_ns") is not None:
-            # A stream's frames are its own pts plus this base, so the file that
-            # produced them is in the sidecar too: the mapping explains itself.
-            sidecar["sync"]["base_ns"] = meta["base_ns"]
-        if extra:
-            sidecar["sync"].update(extra)
-        clocks = state.get("clock") or []
-        if clocks:
-            offsets = [sample["offset"] for sample in clocks]
-            errors = [sample["error"] for sample in clocks]
-            sidecar["sync"]["offset"] = sum(offsets) / len(offsets)
-            sidecar["sync"]["offset_samples"] = len(offsets)
-            # The spread of the samples is the honest error of the offset; half a
-            # round trip is the floor. A frame at 30 fps is 33 ms, so this says
-            # whether the mapping is frame accurate or only approximate.
-            sidecar["sync"]["offset_spread_ms"] = 1000.0 * (
-                max(offsets) - min(offsets)) / 2.0
-            sidecar["sync"]["round_trip_ms"] = 1000.0 * sum(errors) / len(errors)
-        if pts and len(pts) != len(meta["frames"]):
-            # A count that differs means an index would point at the wrong
-            # picture; the timestamps are still good for --at.
-            print("capture: %d frames in the container, %d in the metadata: "
-                  "events keep their frame index, and --at still works"
-                  % (len(pts), len(meta["frames"])))
-    sidecar["events"] = map_events(args.dir, sidecar)
-    with open(os.path.join(args.dir, "recording.json"), "w") as handle:
-        json.dump(sidecar, handle, indent=2)
+    """Kept for callers of the old internal helper; the CLI uses `Session`."""
+    session = Session(dir=args.dir, on_note=print)
+    sidecar = session._finish(recording, state, meta, stop_sampled, extra)
     print_summary(args.dir, sidecar)
     return 0
 
@@ -332,7 +501,7 @@ def print_summary(directory, sidecar):
 
 def cmd_show(args):
     directory = args.dir
-    sidecar_path = os.path.join(directory, "recording.json")
+    sidecar_path = os.path.join(directory, SIDECAR)
     if not os.path.isfile(sidecar_path):
         return fail(args, SCHEMA_RECORDING, "no-recording",
                     "capture: no recording.json in %s (run stop first)" % directory,
@@ -369,7 +538,7 @@ def cmd_frames(args):
         print("capture: ffmpeg is not in PATH", file=sys.stderr)
         return EXIT_PREREQUISITE
     directory = args.dir
-    sidecar_path = args.sidecar or os.path.join(directory, "recording.json")
+    sidecar_path = args.sidecar or os.path.join(directory, SIDECAR)
     if not os.path.isfile(sidecar_path):
         print("capture: no recording.json; run stop first", file=sys.stderr)
         return EXIT_FAILURE
@@ -419,23 +588,26 @@ def cmd_frames(args):
     return 0
 
 
-def main(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(
         description="Record a run once, keep the moments as events, extract "
                     "frames when asked.")
     parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("--dir", default="out/capture",
                         help="where the recording and its events live")
+    parser.add_argument("--serial", default="",
+                        help="serial to use when more than one device is attached")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def with_dir(parser, **kwargs):
-        """Every subcommand takes --dir: the shell writes it after the verb."""
+        """Every subcommand takes --dir and --serial: the shell writes them after
+        the verb, and naming a serial makes two attached devices unambiguous."""
         parser.add_argument("--dir", dest="sub_dir", default="")
+        parser.add_argument("--serial", dest="sub_serial", default="")
         parser.add_argument("--version", action="version", version=VERSION)
         return parser
 
     start = with_dir(sub.add_parser("start", help="start recording the device's screen"))
-    start.add_argument("--serial", default="")
     start.add_argument("--size", default="", help="WxH; native by default")
     start.add_argument("--bit-rate", dest="bit_rate", default="6M")
     # screenstream is the recording to prefer: one hardware encode, times on the
@@ -484,9 +656,15 @@ def main(argv=None):
     read.add_argument("--port", type=int, default=STREAM_PORT)
     read.set_defaults(run=cmd_read)
 
-    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
-    # `--dir` is accepted on either side of the verb; the shell writes it after.
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
+    # `--dir` and `--serial` are accepted on either side of the verb; the shell
+    # writes them after.
     args.dir = args.sub_dir or args.dir
+    args.serial = args.sub_serial or args.serial
     return args.run(args)
 
 

@@ -9,9 +9,22 @@ is not supported by this version of adb"), and `ss` and `/proc/net/tcp6` are
 closed to an app, so python-zeroconf does the lookup and this script hands the
 answer to `adb connect`.
 
+The command is the supported interface for a shell:
+
     adb-connect               # discover, connect, say which port
     adb-connect --pair        # same lookup, for the pairing port
     adb-connect --port 38109  # skip discovery
+
+The same work is available without printing, for a test suite:
+
+    from adb_harness import connect
+
+    port = connect.find(timeout=8)      # Port | None
+    result = connect.connect(port)      # ConnectResult(serial, address, already)
+
+`find` returns a `Port` rather than printing, and `connect` returns where adb
+ended up rather than formatting it. Both raise the exceptions in `errors.py`:
+`NoAdb`, `NoMdns` and `NotConnected`.
 
 Needs adb in PATH, python3 with zeroconf (`pip install zeroconf`), and Wireless
 debugging on in Developer options. A phone that has never been paired with this
@@ -26,8 +39,10 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 
 from . import __version__
+from .errors import NoAdb, NoMdns, NotConnected
 from .output import EXIT_FAILURE, EXIT_PREREQUISITE, emit
 
 # What a phone with Wireless debugging on advertises. `_adb._tcp` is the older
@@ -38,6 +53,46 @@ PAIRING_SERVICE = "_adb-tls-pairing._tcp.local."
 
 SCHEMA = "adb-connect"
 VERSION = "adb-connect %s" % __version__
+
+
+@dataclass(frozen=True)
+class Port:
+    """A wireless-debugging port, and where adb should try to reach it.
+
+    `address` is the `host:port` handed to `adb connect`; `port` is the number on
+    its own, as the JSON contract and `adb-connect --json` report it. `source` is
+    `mdns` (found by a lookup), `port` (named with `--port`) or `attached` (adb
+    already had a device). `serial` is the serial to prefer when more than one
+    device is attached; `candidates` are the addresses to try, loopback first.
+    """
+
+    address: str
+    port: int
+    serial: str = ""
+    source: str = "mdns"
+    name: str = ""
+    candidates: tuple[str, ...] = ()
+
+    @classmethod
+    def from_serial(cls, serial):
+        """The port of a serial adb already has, as `source: attached`."""
+        return cls(address=serial, port=port_of(serial), serial=serial,
+                   source="attached")
+
+
+@dataclass(frozen=True)
+class ConnectResult:
+    """What `adb connect` produced: the serial, the address, and whether it was
+    already there (`already`) rather than connected by this call."""
+
+    serial: str
+    address: str
+    already: bool = False
+    port: int = 0
+    source: str = "mdns"
+    name: str = ""
+    devices: tuple[str, ...] = ()
+    detail: str = ""
 
 
 def adb(*args):
@@ -56,9 +111,21 @@ def attached():
     return serials
 
 
+def require_adb():
+    """Raises `NoAdb` when adb is not in PATH."""
+    if shutil.which("adb") is None:
+        raise NoAdb("adb is not in PATH")
+
+
 def discover(seconds):
-    """Browses mDNS and returns (connect services, pairing services)."""
-    from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+    """Browses mDNS and returns (connect services, pairing services).
+
+    Raises `NoMdns` when python-zeroconf is not installed.
+    """
+    try:
+        from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
+    except ImportError as why:
+        raise NoMdns("python-zeroconf is missing: pip install zeroconf") from why
 
     found = []
     pairing = []
@@ -137,19 +204,64 @@ def target(address, port):
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
 
 
-def connect(info):
-    """Tries the advertised addresses until one is a real adb device.
+def port_for(info, serial=""):
+    """The `Port` an advertised mDNS service stands for."""
+    candidates = tuple(target(address, info.port) for address in addresses(info))
+    address = candidates[0] if candidates else target("127.0.0.1", info.port)
+    return Port(address=address, port=info.port, serial=serial, source="mdns",
+                name=getattr(info, "name", ""), candidates=candidates)
 
-    <p>Returns the target that worked, or the last one tried and what adb said
-    about it, so a refusal names the address it refused.
+
+def find(timeout=8.0, *, port=None, serial=""):
+    """The wireless-debugging port, or None when nothing is advertised.
+
+    A device already in adb's `device` state is returned with `source
+    `"attached"` without asking mDNS; `port` skips discovery and names loopback.
+    `serial` is the serial to prefer when more than one device is attached.
+
+    Raises `NoAdb` when adb is missing and `NoMdns` when python-zeroconf is.
     """
-    where, said = "", ""
-    for address in addresses(info):
-        where = target(address, info.port)
+    require_adb()
+    if port is not None:
+        where = target("127.0.0.1", port)
+        return Port(address=where, port=port, serial=serial, source="port",
+                    candidates=(where,))
+    devices = attached()
+    if devices:
+        chosen = serial if serial in devices else devices[0]
+        return Port.from_serial(chosen)
+    found, _pairing = discover(timeout)
+    if not found:
+        return None
+    return port_for(found[0], serial)
+
+
+def connect(port):
+    """Runs `adb connect` for a `Port` and returns a `ConnectResult`.
+
+    Every candidate address is tried until adb reports a device. A `Port` with
+    `source="attached"` is already connected and returns `already=True` without
+    touching adb. Raises `NotConnected` when no address produces a device; the
+    exception carries the port and the last thing adb said.
+    """
+    if port.source == "attached":
+        serial = port.serial or port.address
+        return ConnectResult(serial=serial, address=port.address, already=True,
+                             port=port.port or port_of(serial),
+                             source="attached", devices=(serial,))
+    candidates = port.candidates or (port.address,)
+    where, said = port.address, ""
+    for where in candidates:
         said = adb("connect", where)
-        if attached():
-            return where, said
-    return None, f"{where}: {said}"
+        devices = attached()
+        if devices:
+            serial = (port.serial if port.serial in devices
+                      else where if where in devices else devices[0])
+            return ConnectResult(serial=serial, address=where, already=False,
+                                 port=port.port or port_of(where),
+                                 source=port.source, name=port.name,
+                                 devices=tuple(devices), detail=said)
+    raise NotConnected(f"{where}: {said}", port=port.port, said=said)
 
 
 def port_of(serial):
@@ -172,6 +284,8 @@ def main(argv=None):
                         help="seconds to wait for an advertisement (default 8)")
     parser.add_argument("--port", type=int,
                         help="connect to 127.0.0.1 at this port instead of asking mDNS")
+    parser.add_argument("--serial", default="",
+                        help="serial to prefer when more than one device is attached")
     parser.add_argument("--pair", action="store_true",
                         help="print the pairing command instead of connecting")
     parser.add_argument("--json", action="store_true",
@@ -200,10 +314,11 @@ def main(argv=None):
     if args.port is None:
         devices = attached()
         if devices and not args.pair:
+            chosen = args.serial if args.serial in devices else devices[0]
+            result = connect(Port.from_serial(chosen))
             if args.json:
-                serial = devices[0]
-                emit(SCHEMA, ok=True, address=serial, port=port_of(serial),
-                     serial=serial, source="attached", waited_s=0.0)
+                emit(SCHEMA, ok=True, address=result.address, port=result.port,
+                     serial=result.serial, source="attached", waited_s=0.0)
             else:
                 print(f"already connected: {', '.join(devices)}")
             return 0
@@ -251,22 +366,22 @@ def main(argv=None):
         # an old port can still be around, so every candidate is tried.
         detail = ""
         for info in found:
-            where, said = connect(info)
-            if where is not None:
-                serials = attached()
-                serial = where if where in serials else (serials[0] if serials else "")
-                if args.json:
-                    emit(SCHEMA, ok=True, address=where, port=info.port,
-                         serial=serial, source="mdns", waited_s=waited)
-                else:
-                    print(f"connected to {where}")
-                    print(f"  advertised as {info.name}")
-                    for serial in serials:
-                        print(f"  device: {serial}")
-                return 0
-            detail = said
-            if not args.json:
-                print(said, file=sys.stderr)
+            try:
+                result = connect(port_for(info, args.serial))
+            except NotConnected as why:
+                detail = str(why)
+                if not args.json:
+                    print(detail, file=sys.stderr)
+                continue
+            if args.json:
+                emit(SCHEMA, ok=True, address=result.address, port=info.port,
+                     serial=result.serial, source="mdns", waited_s=waited)
+            else:
+                print(f"connected to {result.address}")
+                print(f"  advertised as {info.name}")
+                for serial in result.devices:
+                    print(f"  device: {serial}")
+            return 0
         if args.json:
             return failure(args, "stale-port",
                            detail or "the advertised port did not answer",
@@ -282,21 +397,23 @@ def main(argv=None):
         return EXIT_FAILURE
 
     where = target("127.0.0.1", args.port)
-    said = adb("connect", where)
-    if not (args.json or args.quiet):
-        print(said)
-    devices = attached()
-    if not devices:
+    port = Port(address=where, port=args.port, serial=args.serial, source="port",
+                candidates=(where,))
+    try:
+        result = connect(port)
+    except NotConnected as why:
+        if not (args.json or args.quiet):
+            print(why.said or str(why))
         if args.json:
-            return failure(args, "stale-port", f"{where}: {said}",
-                           port=args.port)
+            return failure(args, "stale-port", str(why), port=args.port)
         return EXIT_FAILURE
-    serial = where if where in devices else devices[0]
+    if not (args.json or args.quiet):
+        print(result.detail)
     if args.json:
-        emit(SCHEMA, ok=True, address=where, port=args.port, serial=serial,
-             source="port", waited_s=0.0)
+        emit(SCHEMA, ok=True, address=result.address, port=args.port,
+             serial=result.serial, source="port", waited_s=0.0)
     else:
-        print(f"connected to {where}")
+        print(f"connected to {result.address}")
     return 0
 
 
