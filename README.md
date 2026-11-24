@@ -257,9 +257,37 @@ module:
 | `tests/test_capture_lifecycle.py` | `capture.py`'s `Session` order: `stop` with no `start`, two `start`s on one session, an event before `start` (raised by the library, a no-op from the command), `show` with no recording, and a sidecar whose video is missing, each with the documented error or exit code. |
 | `tests/test_library.py` | the library surface of `connect`, `capture.Session` and `watch.Watcher`: return values, exceptions, an event that costs no process, and a watcher asked about in process. |
 | `tests/test_cli.py` | the commands' machine-readable output, exit codes and unchanged prose, with adb and mDNS replaced by Mocks. |
+| `tests/test_emulator_script.py` | `tests/emulator.sh`'s preflight: it fails, with a clear message, when `adb devices` has no attached `emulator-*`, and accepts one. The full smoke test runs only in the emulator workflow. |
 
-What needs a real device — recording, pulling, extracting frames, reconnecting
-after a reboot — is checked where the tools are used, in
+### Emulator smoke test
+
+`.github/workflows/emulator-e2e.yml` runs after a merge to `main` (and on a
+manual dispatch). It boots an API 35 `google_apis` x86_64 AVD with KVM and runs
+`tests/emulator.sh`, which:
+
+- refuses to start without an `emulator-*` in `adb devices`, so a missing device
+  is a failed job, not a skipped one;
+- installs this checkout into a throwaway virtualenv and asks `adb-connect
+  --json` for the attached serial, asserting that `source` is `attached`;
+- records `screenrecord` into `out/emulator`, changes the screen with `input
+  keyevent`/`input swipe`, marks an event, stops, and asserts a non-empty MP4,
+  its sidecar, and a frame mapped to the event;
+- exercises `adb-watch --status --json` against the attached serial;
+- uses `ffprobe`/`ffmpeg` only when they are already present; the base recording
+  and mapping path still needs nothing beyond `adb` and the package.
+
+On failure the job uploads `out/emulator/` — the recording, sidecar, events and
+the JSON from each command. The scope is deliberately narrow:
+**attached-emulator smoke only**. It does not cover the wireless mDNS/reconnect
+path, screenstream's app path, the MediaTek encoder, real-radio behaviour or an
+exact Blackview XPLORE 2. Those still need the self-hosted phone and
+`android-accessible-terminal`'s e2e suite. The workflow runs on `main`, not on
+pull requests, so the first green is the post-merge run; a pull request can only
+show the preflight and the deviceless suite.
+
+The attached-emulator job covers recording, pulling and mapping against a real
+Android runtime. Wireless reconnect after a reboot, the vendor encoder and
+exact-device behaviour are still checked where the tools are used, in
 `android-accessible-terminal`'s e2e suite. CI also builds the package on every
 push and installs the wheel and the sdist in a fresh virtualenv, because tests
 against the checkout cannot see a wheel with the wrong entry points or a missing
